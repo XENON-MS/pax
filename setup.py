@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
+import six
+import os
 
 try:
     from setuptools import setup
@@ -12,6 +13,30 @@ history = open('HISTORY.rst').read().replace('.. :changelog:', '')
 
 requirements = open('requirements.txt').read().splitlines()
 
+# configparser is not in the python2 standard library:
+if six.PY2:
+    requirements.append('configparser')
+
+# For some reason h5py is often not seen by pip if it was installed by conda...
+# so check for h5py presence manually, and remove it from requirements if already found.
+try:
+    import h5py
+except ImportError:
+    pass
+else:
+    del requirements[requirements.index('h5py')]
+
+try:
+    import ROOT
+except ImportError:
+    pass
+
+# Snappy cannot be installed automatically on windows
+if os.name == 'nt':
+    print("You're on windows: we can't install snappy manually. "
+          "See http://xenon1t.github.io/pax/faq.html#can-i-set-up-pax-on-my-windows-machine")
+    del requirements[requirements.index('python-snappy>=0.5')]
+
 test_requirements = requirements + ['flake8',
                                     'tox',
                                     'coverage',
@@ -19,7 +44,7 @@ test_requirements = requirements + ['flake8',
 
 setup(
     name='pax',
-    version='3.2.0',
+    version='4.9.3',
     description='PAX is the raw data processor for the XENON1T experiment, with support for other LXe TPCs.',
     long_description=readme + '\n\n' + history,
     author='Christopher Tunnell and Jelle Aalbers for the XENON1T collaboration',
@@ -28,14 +53,13 @@ setup(
     packages=[  'pax',
                 'pax.config',
                 'pax.plugins',
-                'pax.plugins.corrections',
-                'pax.plugins.peak_processing',
-                'pax.plugins.plotting',
-                'pax.plugins.signal_processing',
-                'pax.plugins.for_tests',
                 'pax.plugins.io',
+                'pax.plugins.signal_processing',
+                'pax.plugins.peak_processing',
                 'pax.plugins.posrec',
-                'pax.plugins.misc'],
+                'pax.plugins.interaction_processing',
+                'pax.trigger_plugins',
+                ],
     package_dir={'pax': 'pax'},
     package_data={'pax': ['config/*.ini', 'data/*.*']},
     scripts=['bin/paxer', 'bin/event-builder',

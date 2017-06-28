@@ -3,16 +3,19 @@ Waveform simulator ("FaX") - physics backend
 The only I/O stuff here is pax event creation, everything else is in the WaveformSimulator plugins
 """
 
+from __future__ import division
 import logging
 import math
 import time
 
 import numpy as np
+
 from scipy import stats
 
 from pax import units, utils, datastructure
+from pax.PatternFitter import PatternFitter
+from pax.InterpolatingMap import InterpolatingMap
 from pax.utils import Memoize
-
 
 log = logging.getLogger('SimulationCore')
 
@@ -20,72 +23,311 @@ log = logging.getLogger('SimulationCore')
 class Simulator(object):
 
     def __init__(self, config_to_init):
-        self.config = config_to_init
+        c = self.config = config_to_init
 
         # Should we repeat events?
-        if 'event_repetitions' not in self.config:
-            self.config['event_repetitions'] = 1
+        if 'event_repetitions' not in c:
+            c['event_repetitions'] = 1
 
         # Primary excimer fraction from Nest Version 098
         # See G4S1Light.cc line 298
-        density = self.config['liquid_density'] / (units.g / units.cm ** 3)
+        density = c['liquid_density'] / (units.g / units.cm ** 3)
         excfrac = 0.4 - 0.11131 * density - 0.0026651 * density ** 2    # primary / secondary excimers
         excfrac = 1 / (1 + excfrac)                                     # primary / all excimers
         # primary / all excimers that produce a photon:
-        excfrac /= 1 - (1 - excfrac) * (1 - self.config['s1_ER_recombination_fraction'])
-        self.config['s1_ER_primary_excimer_fraction'] = excfrac
+        excfrac /= 1 - (1 - excfrac) * (1 - c['s1_ER_recombination_fraction'])
+        c['s1_ER_primary_excimer_fraction'] = excfrac
         log.debug('Inferred s1_ER_primary_excimer_fraction %s' % excfrac)
 
         # Recombination time from NEST 2014
         # 3.5 seems fishy, they fit an exponential to data, but in the code they use a non-exponential distribution...
-        efield = (self.config['drift_field'] / (units.V / units.cm))
-        self.config['s1_ER_recombination_time'] = 3.5 / 0.18 * (1 / 20 + 0.41) * math.exp(-0.009 * efield)
-        log.debug('Inferred s1_ER_recombination_time %s ns' % self.config['s1_ER_recombination_time'])
+        efield = (c['drift_field'] / (units.V / units.cm))
+        c['s1_ER_recombination_time'] = 3.5 / 0.18 * (1 / 20 + 0.41) * math.exp(-0.009 * efield)
+        log.debug('Inferred s1_ER_recombination_time %s ns' % c['s1_ER_recombination_time'])
 
         # Calculate particle number density in the gas (ideal gas law)
-        number_density_gas = self.config['pressure'] / (units.boltzmannConstant * self.config['temperature'])
+        number_density_gas = c['pressure'] / (units.boltzmannConstant * c['temperature'])
 
         # electric field in the gas
         # Formula from xenon:xenon100:analysis:jacob:s2gain_v2
-        e_in_gas = self.config['lxe_dielectric_constant'] * self.config['anode_voltage'] / (
-            self.config['lxe_dielectric_constant'] * self.config['elr_gas_gap_length'] +
-            (self.config['gate_to_anode_distance'] - self.config['elr_gas_gap_length'])
+        e_in_gas = c['lxe_dielectric_constant'] * c['anode_voltage'] / (
+            c['lxe_dielectric_constant'] * c['elr_gas_gap_length'] +
+            (c['gate_to_anode_distance'] - c['elr_gas_gap_length'])
         )
 
         # Reduced electric field in the gas
-        self.config['reduced_e_in_gas'] = e_in_gas / number_density_gas
+        c['reduced_e_in_gas'] = e_in_gas / number_density_gas
         log.debug("Inferred a reduced electric field of %s Td in the gas" % (
-            self.config['reduced_e_in_gas'] / units.Td))
+            c['reduced_e_in_gas'] / units.Td))
 
         # Which channels stand to receive any photons?
-        # TODO: In XENON100, channel 0 will receive photons unless magically_avoid_dead_pmts=True
-        # To prevent this, subtract 0 from channel_for_photons. But don't do that for XENON1T!!
-        channels_for_photons = self.config['channels_in_detector']['tpc']
-        if self.config.get('magically_avoid_dead_pmts', False):
-            channels_for_photons = [ch for ch in channels_for_photons if self.config['gains'][ch] > 0]
-        if self.config.get('magically_avoid_s1_excluded_pmts', False) and \
-           'channels_excluded_for_s1' in self.config:
+        channels_for_photons = c['channels_in_detector']['tpc']
+        if c['pmt_0_is_fake']:
+            channels_for_photons = [ch for ch in channels_for_photons if ch != 0]
+        if c.get('magically_avoid_dead_pmts', False):
+            channels_for_photons = [ch for ch in channels_for_photons if c['gains'][ch] > 0]
+        if c.get('magically_avoid_s1_excluded_pmts', False) and \
+           'channels_excluded_for_s1' in c:
             channels_for_photons = [ch for ch in channels_for_photons
-                                    if ch not in self.config['channels_excluded_for_s1']]
-        self.config['channels_for_photons'] = channels_for_photons
+                                    if ch not in c['channels_excluded_for_s1']]
+        c['channels_for_photons'] = channels_for_photons
 
         # Determine sensible length of a pmt pulse to simulate
-        dt = self.config['sample_duration']
-        self.config['samples_before_pulse_center'] = math.ceil(
-            self.config['pulse_width_cutoff'] * self.config['pmt_rise_time'] / dt
+        dt = c['sample_duration']
+        c['samples_before_pulse_center'] = math.ceil(
+            c['pulse_width_cutoff'] * c['pmt_rise_time'] / dt
         )
-        self.config['samples_after_pulse_center'] = math.ceil(
-            self.config['pulse_width_cutoff'] * self.config['pmt_fall_time'] / dt
+        c['samples_after_pulse_center'] = math.ceil(
+            c['pulse_width_cutoff'] * c['pmt_fall_time'] / dt
         )
         log.debug('Simulating %s samples before and %s samples after PMT pulse centers.' % (
-            self.config['samples_before_pulse_center'], self.config['samples_after_pulse_center']))
+            c['samples_before_pulse_center'], c['samples_after_pulse_center']))
 
         # Load real noise data from file, if requested
-        if self.config['real_noise_file']:
-            self.noise_data = np.load(utils.data_file_name(self.config['real_noise_file']))['arr_0']
+        if c['real_noise_file']:
+            self.noise_data = np.load(utils.data_file_name(c['real_noise_file']))['arr_0']
             # The silly XENON100 PMT offset again: it's relevant for indexing the array of noise data
             # (which is one row per channel)
-            self.channel_offset = 1 if self.config['pmt_0_is_fake'] else 0
+            self.channel_offset = 1 if c['pmt_0_is_fake'] else 0
+
+        # Load light yields
+        self.s1_light_yield_map = InterpolatingMap(utils.data_file_name(c['s1_light_yield_map']))
+        self.s2_light_yield_map = InterpolatingMap(utils.data_file_name(c['s2_light_yield_map']))
+
+        # Init s2 per pmt lce map
+        qes = np.array(c['quantum_efficiencies'])
+        if c.get('s2_patterns_file', None) is not None:
+            self.s2_patterns = PatternFitter(filename=utils.data_file_name(c['s2_patterns_file']),
+                                             zoom_factor=c.get('s2_patterns_zoom_factor', 1),
+                                             adjust_to_qe=qes[c['channels_top']],
+                                             default_errors=c['relative_qe_error'] + c['relative_gain_error'])
+        else:
+            self.s2_patterns = None
+
+        # Init s1 pattern maps
+        # NB: do NOT adjust patterns for QE, map is data derived, so no need.
+        log.debug("Initializing s1 patterns...")
+        if c.get('s1_patterns_file', None) is not None:
+            self.s1_patterns = PatternFitter(filename=utils.data_file_name(c['s1_patterns_file']),
+                                             zoom_factor=c.get('s1_patterns_zoom_factor', 1),
+                                             default_errors=c['relative_qe_error'] + c['relative_gain_error'])
+        else:
+            self.s1_patterns = None
+
+        self.clear_signals_queue()
+
+    def clear_signals_queue(self):
+        """Prepares the waveform simulator for a new event.
+        """
+        self.arrival_times_per_channel = {ch: [] for ch in range(self.config['n_channels'])}
+
+    def queue_signal(self, photon_timings, x=0, y=0, z=0):
+        """Add a signal due to isotropic light emission to the waveform simulator
+            photon_timings: list of photon emission times (ns) since start of the event.
+                            All photons listed here will be detected!
+            x, y, z: position of emission (standard coordinate system, pax units = cm)
+        """
+        if not len(photon_timings):
+            return
+
+        # Correct for PMT Transition Time Spread
+        photon_timings += np.random.normal(self.config['pmt_transit_time_mean'],
+                                           self.config['pmt_transit_time_spread'],
+                                           len(photon_timings))
+
+        # Shuffle all timings in the array, so channel 1 doesn't always get the first photon
+        np.random.shuffle(photon_timings)
+
+        # Get the photon counts per channel
+        hitp = self.distribute_photons(len(photon_timings), x, y, z)
+
+        # Split photon times over channels, add to the currently queued photon signals
+        # Note the last array is always zero  # TODO: did you check this
+        q = np.split(photon_timings, np.cumsum(hitp))
+        assert len(q[-1]) == 0
+        q = q[:-1]
+        for channel_i, photon_times in enumerate(q):
+            self.arrival_times_per_channel[channel_i] = np.concatenate((self.arrival_times_per_channel[channel_i],
+                                                                        photon_times))
+
+    def make_pax_event(self):
+        """Simulate PMT response to the queued photon signals
+        Returns None if no photons have been queued else returns start_time (in units, ie ns), pmt waveform matrix
+        # TODO: Account for random initial digitizer state wrt interaction? Where?
+        """
+        log.debug("Now performing hitpattern to waveform conversion")
+        start_time = int(time.time() * units.s)
+
+        # Find out the duration of the event
+        all_times = np.concatenate(list(self.arrival_times_per_channel.values()))
+        if not len(all_times):
+            log.warning("No photons to simulate: making a noise-only event")
+            max_time = 0
+        else:
+            max_time = np.concatenate(list(self.arrival_times_per_channel.values())).max()
+
+        event = datastructure.Event(n_channels=self.config['n_channels'],
+                                    start_time=start_time,
+                                    stop_time=start_time + int(max_time + 2 * self.config['event_padding']),
+                                    sample_duration=self.config['sample_duration'])
+        # Ensure the event length is even (else it cannot be written to XED)
+        if event.length() % 2 != 0:
+            event.stop_time += self.config['sample_duration']
+
+        # Convenience variables
+        dt = self.config['sample_duration']
+        dv = self.config['digitizer_voltage_range'] / 2 ** (self.config['digitizer_bits'])
+
+        # Build waveform channel by channel
+        for channel, photon_detection_times in self.arrival_times_per_channel.items():
+            # If the channel is dead, we don't do anything.
+            if self.config['gains'][channel] == 0 or (self.config['pmt_0_is_fake'] and channel == 0):
+                continue
+
+            photon_detection_times = np.array(photon_detection_times)
+
+            log.debug("Simulating %d photons in channel %d (gain=%s, gain_sigma=%s)" % (
+                len(photon_detection_times), channel,
+                self.config['gains'][channel], self.config['gain_sigmas'][channel]))
+
+            # Use a Gaussian truncated to positive values for the SPE gain distribution
+            gains = truncated_gauss_rvs(my_mean=self.config['gains'][channel],
+                                        my_std=self.config['gain_sigmas'][channel],
+                                        left_boundary=0,
+                                        right_boundary=float('inf'),
+                                        n_rvs=len(photon_detection_times))
+
+            # Add PMT afterpulses
+            ap_times = []
+            ap_gains = []
+            for ap_data in self.config['pmt_afterpulse_types'].values():
+                ap_data.setdefault('gain_mean', self.config['gains'][channel])
+                ap_data.setdefault('gain_rms', self.config['gain_sigmas'][channel])
+
+                # How many photons will make this kind of afterpulse?
+                n_afterpulses = np.random.binomial(n=len(photon_detection_times),
+                                                   p=ap_data['p'])
+                if not n_afterpulses:
+                    continue
+
+                # Find the time and gain of the afterpulses
+                dist_kwargs = ap_data['time_parameters']
+                dist_kwargs['size'] = n_afterpulses
+                ap_times.extend(np.random.choice(photon_detection_times, size=n_afterpulses, replace=False) +
+                                getattr(np.random, ap_data['time_distribution'])(**dist_kwargs))
+                ap_gains.extend(truncated_gauss_rvs(my_mean=ap_data['gain_mean'],
+                                                    my_std=ap_data['gain_rms'],
+                                                    left_boundary=0,
+                                                    right_boundary=float('inf'),
+                                                    n_rvs=n_afterpulses))
+
+            gains = np.concatenate((gains, ap_gains))
+            photon_detection_times = np.concatenate((photon_detection_times, ap_times))
+
+            #  Add padding, sort (eh.. or were we already sorted? and is sorting necessary at all??)
+            pmt_pulse_centers = np.sort(photon_detection_times + self.config['event_padding'])
+
+            # Build the waveform pulse by pulse (bin by bin was slow, hope this is faster)
+
+            # Compute offset & center index for each pe-pulse
+            # 'index' refers to the (hypothetical) event waveform, as usual
+            pmt_pulse_centers = np.array(pmt_pulse_centers, dtype=np.int)
+            offsets = pmt_pulse_centers % dt
+            center_index = (pmt_pulse_centers - offsets) / dt   # Absolute index in waveform of pe-pulse center
+            center_index = center_index.astype(np.int)
+
+            # Simulate an event-long waveform in this channel
+            # Remember start padding has already been added to times, so just one padding in end_index
+            start_index = 0
+            end_index = event.length() - 1
+            pulse_length = end_index - start_index + 1
+
+            current_wave = np.zeros(pulse_length)
+
+            for i, _ in enumerate(pmt_pulse_centers):
+                # Add some current for this photon pulse
+                # Compute the integrated pmt pulse at various samples, then
+                # do their diffs/dt
+                generated_pulse = self.pmt_pulse_current(gain=gains[i], offset=offsets[i])
+
+                # +1 due to np.diff in pmt_pulse_current   #????
+                left_index = center_index[i] - start_index + 1
+                left_index -= int(self.config['samples_before_pulse_center'])
+                righter_index = center_index[i] - start_index + 1
+                righter_index += int(self.config['samples_after_pulse_center'])
+
+                # Abandon the pulse if it goes the left/right boundaries
+                if len(generated_pulse) != righter_index - left_index:
+                    raise RuntimeError(
+                        "Generated pulse is %s samples long, can't be inserted between %s and %s" % (
+                            len(generated_pulse), left_index, righter_index))
+                elif left_index < 0:
+                    log.debug("Invalid left index %s: can't be negative" % left_index)
+                    continue
+                elif righter_index >= len(current_wave):
+                    log.debug("Invalid right index %s: can't be longer than length of wave (%s)!" % (
+                        righter_index, len(current_wave)))
+                    continue
+
+                current_wave[left_index: righter_index] += generated_pulse
+
+            # Did you order some Gaussian current noise with that?
+            if self.config['gauss_noise_sigma']:
+                # / dt is for charge -> current conversion, as in pmt_pulse_current
+                noise_sigma_current = self.config['gauss_noise_sigma'] * self.config['gains'][channel] / dt,
+                current_wave += np.random.normal(0, noise_sigma_current, len(current_wave))
+
+            # Convert from PMT current to ADC counts
+            adc_wave = current_wave
+            adc_wave *= self.config['pmt_circuit_load_resistor']    # Now in voltage
+            adc_wave *= self.config['external_amplification']       # Now in voltage after amplifier
+            adc_wave /= dv                                          # Now in float ADC counts above baseline
+            adc_wave = np.trunc(adc_wave)                           # Now in integer ADC counts "" ""
+            # Could round instead of trunc... who cares?
+
+            # PMT signals are negative excursions, so flip them.
+            adc_wave = - adc_wave
+
+            # Did you want to superpose onto real noise samples?
+            if self.config['real_noise_file']:
+                sample_size = self.config['real_noise_sample_size']
+                available_noise_samples = self.noise_data.shape[1] / sample_size
+                needed_noise_samples = int(math.ceil(pulse_length / sample_size))
+                chosen_noise_sample_numbers = np.random.randint(0,
+                                                                available_noise_samples - 1,
+                                                                needed_noise_samples)
+                # Extract the chosen noise samples and concatenate them
+                # Have to use a listcomp here, unless you know a way to select multiple slices in numpy?
+                #  -- yeah making an index list with np.arange would work, but honestly??
+                real_noise = np.concatenate([
+                    self.noise_data[channel - self.channel_offset][nsn * sample_size:(nsn + 1) * sample_size]
+                    for nsn in chosen_noise_sample_numbers
+                ])
+                # Adjust the noise amplitude if needed, then add it to the ADC wave
+                noise_amplitude = self.config.get('adjust_noise_amplitude', {}).get(str(channel), 1)
+                if noise_amplitude != 1:
+                    # Determine a rough baseline for the noise, then adjust towards it
+                    baseline = np.mean(real_noise[:min(len(real_noise), 50)])
+                    real_noise = baseline + noise_amplitude * (real_noise - baseline)
+                adc_wave += real_noise[:pulse_length]
+
+            else:
+                # If you don't want to superpose onto real noise,
+                # we should add a reference baseline
+                adc_wave += self.config['digitizer_reference_baseline']
+
+            # Digitizers have finite number of bits per channel, so clip the signal.
+            adc_wave = np.clip(adc_wave, 0, 2 ** (self.config['digitizer_bits']))
+
+            event.pulses.append(datastructure.Pulse(
+                channel=channel,
+                left=start_index,
+                raw_data=adc_wave.astype(np.int16)))
+
+        log.debug("Simulated pax event of %s samples length and %s pulses "
+                  "created." % (event.length(), len(event.pulses)))
+        self.clear_signals_queue()
+        return event
 
     def s2_electrons(self, electrons_generated=None, z=0., t=0.):
         """Return a list of electron arrival times in the ELR region caused by an S2 process.
@@ -96,13 +338,13 @@ class Simulator(object):
         As usual, all units in the same system used by pax (if you specify raw values: ns, cm)
         """
 
-        if z < 0:
-            log.warning("Unphysical depth: %s cm below gate. Not generating S2." % z)
+        if not - self.config['tpc_length'] <= z <= 0:
+            log.warning("Unphysical depth: %s cm below gate. Not generating S2." % - z)
             return []
         log.debug("Creating an s2 from %s electrons..." % electrons_generated)
 
         # Average drift time, taking faster drift velocity after gate into account
-        drift_time_mean = z / self.config['drift_velocity_liquid'] + \
+        drift_time_mean = - z / self.config['drift_velocity_liquid'] + \
             (self.config['gate_to_anode_distance'] - self.config['elr_gas_gap_length']) \
             / self.config['drift_velocity_liquid_above_gate']
 
@@ -126,19 +368,18 @@ class Simulator(object):
             e_arrival_times += np.random.normal(drift_time_mean, drift_time_stdev, electrons_seen)
         return e_arrival_times
 
-    def s1_photons(self, n_photons, recoil_type, t=0.):
+    def s1_photons(self, n_photons, recoil_type, x=0., y=0., z=0, t=0.):
+        """Returns a list of photon detection times at the PMT caused by an S1 emitting n_photons.
         """
-        Returns a list of photon production times caused by an S1 process.
-
-        """
-        # Apply detection efficiency
+        # Apply light yield / detection efficiency
         log.debug("Creating an s1 from %s photons..." % n_photons)
-        n_photons = np.random.binomial(n=n_photons, p=self.config['s1_detection_efficiency'])
+        ly = self.s1_light_yield_map.get_value(x, y, z) * self.config['s1_detection_efficiency']
+        n_photons = np.random.binomial(n=n_photons, p=ly)
         log.debug("    %s photons are detected." % n_photons)
         if n_photons == 0:
             return np.array([])
 
-        if recoil_type == 'ER':
+        if recoil_type.lower() == 'er':
 
             # How many of these are primary excimers? Others arise through recombination.
             n_primaries = np.random.binomial(n=n_photons, p=self.config['s1_ER_primary_excimer_fraction'])
@@ -166,7 +407,7 @@ class Simulator(object):
 
             timings = np.concatenate((primary_timings, secondary_timings))
 
-        elif recoil_type == 'NR':
+        elif recoil_type.lower() == 'nr':
 
             # Neglible recombination time, same singlet/triplet ratio for primary & secondary excimers
             # Hence, we don't care about primary & secondary excimers at all:
@@ -177,20 +418,34 @@ class Simulator(object):
                 singlet_ratio=self.config['s1_NR_singlet_fraction']
             )
 
+        elif recoil_type.lower() == 'alpha':
+
+            # again neglible recombination time, same singlet/triplet ratio for primary & secondary excimers
+            # Hence, we don't care about primary & secondary excimers at all:
+            timings = self.singlet_triplet_delays(
+                np.zeros(n_photons),
+                t1=self.config['alpha_singlet_lifetime_liquid'],
+                t3=self.config['alpha_triplet_lifetime_liquid'],
+                singlet_ratio=self.config['s1_ER_alpha_singlet_fraction']
+            )
+
+        elif recoil_type.lower() == 'led':
+
+            # distribute photons uniformly within the LED pulse length
+            timings = np.random.uniform(0, self.config['led_pulse_length'],
+                                        size=n_photons)
+
         else:
-            raise ValueError('Recoil type must be ER or NR, not %s' % type)
+            raise ValueError('Recoil type must be ER, NR, alpha or LED, not %s' % type)
 
         return timings + t * np.ones(len(timings))
 
-    def s2_scintillation(self, electron_arrival_times):
-        """
-        Given a list of electron arrival times, returns photon production times
-        """
-
+    def s2_scintillation(self, electron_arrival_times, x=0.0, y=0.0):
+        """Given a list of electron arrival times, returns photon production times"""
         # How many photons does each electron make?
-        # TODO: xy correction!
+        c = self.config
         photons_produced = np.random.poisson(
-            self.config['s2_secondary_sc_gain_density'] * self.config['elr_gas_gap_length'],
+            c['s2_secondary_sc_gain_density'] * c['elr_gas_gap_length'] * self.s2_light_yield_map.get_value(x, y),
             len(electron_arrival_times)
         )
         total_photons = np.sum(photons_produced)
@@ -208,9 +463,9 @@ class Simulator(object):
         # Account for singlet/triplet excimer decay times
         return self.singlet_triplet_delays(
             s2_pe_times,
-            t1=self.config['singlet_lifetime_gas'],
-            t3=self.config['triplet_lifetime_gas'],
-            singlet_ratio=self.config['singlet_fraction_gas']
+            t1=c['singlet_lifetime_gas'],
+            t3=c['triplet_lifetime_gas'],
+            singlet_ratio=c['singlet_fraction_gas']
         )
 
     def singlet_triplet_delays(self, times, t1, t3, singlet_ratio):
@@ -271,289 +526,101 @@ class Simulator(object):
             self.config['pmt_fall_time'],
         )
 
-    def make_hitpattern(self, photon_times):
-        return SimulatedHitpattern(config=self.config, photon_timings=photon_times)
-
-    def to_pax_event(self, hitpattern):
-        """Simulate PMT response to a hitpattern of photons
-        Returns None if you pass a hitlist without any hits
-        returns start_time (in units, ie ns), pmt waveform matrix
+    def distribute_photons(self, n_photons, x, y, z):
+        """Distribute n_photons over the TPC PMTs, with LCE appropriate to (x, y, z)
+        :return: numpy array of length == sim.config['n_channels'] with photon count per channel
         """
-        if not isinstance(hitpattern, SimulatedHitpattern):
-            raise ValueError("to_pax_event takes an instance of SimulatedHitpattern, you gave a %s." % type(hitpattern))
+        if z == - self.config['gate_to_anode_distance']:
+            # Use the S2 pattern information
+            if not self.s2_patterns:
+                return self.randomize_photons_over_channels(n_photons, self.config['channels_in_detector']['tpc'])
 
-        # Create pax event
-        start_time = int(time.time() * units.s)
-        event = datastructure.Event(
-            n_channels=self.config['n_channels'],
-            start_time=start_time,
-            stop_time=start_time + int(hitpattern.max + 2 * self.config['event_padding']),
-            sample_duration=self.config['sample_duration'],
-        )
+            # How many photons to the top array?
+            n_top = np.random.binomial(n=n_photons, p=self.config['s2_mean_area_fraction_top'])
 
-        log.debug("Now performing hitpattern to waveform conversion for %s photons" % hitpattern.n_photons)
-        # TODO: Account for random initial digitizer state  wrt interaction?
-        # Where?
-
-        # Convenience variables
-        dt = self.config['sample_duration']
-        dV = self.config['digitizer_voltage_range'] / 2 ** (self.config['digitizer_bits'])  # noqa
-
-        # Build waveform channel by channel
-        for channel, photon_detection_times in hitpattern.arrival_times_per_channel.items():
-            photon_detection_times = np.array(photon_detection_times)
-
-            #  Add padding, sort (eh.. or were we already sorted? and is sorting necessary at all??)
-            all_pmt_pulse_centers = np.sort(photon_detection_times + self.config['event_padding'])
-
-            if self.config['cheap_zle']:
-                # No photons in this channel -- don't bother simulating noise
-                if len(photon_detection_times) == 0:
-                    continue
-                # Cluster into pulses for cheap ZLE
-                pmt_pulse_center_clusters = utils.cluster_by_diff(all_pmt_pulse_centers, 2 * self.config['zle_padding'])
+            # Distribute a fraction of the top photons randomly, if the user asked for it
+            # This enables robustness testing of the position reconstruction
+            p_random = self.config.get('randomize_fraction_of_s2_top_array_photons', 0)
+            if p_random:
+                n_random = np.random.binomial(n=n_photons, p=p_random)
+                hitp = self.distribute_photons_by_pattern(n_top - n_random, self.s2_patterns, (x, y))
+                hitp += self.randomize_photons_over_channels(n_random, channels=self.config['channels_top'])
             else:
-                # All in one cluster...
-                pmt_pulse_center_clusters = [all_pmt_pulse_centers]
+                hitp = self.distribute_photons_by_pattern(n_top, self.s2_patterns, (x, y))
 
-            for pmt_pulse_centers in pmt_pulse_center_clusters:
-
-                # Build the waveform pulse by pulse (bin by bin was slow, hope this
-                # is faster)
-
-                # Compute offset & center index for each pe-pulse
-                # 'index' refers to the (hypothetical) event waveform, as usual
-                pmt_pulse_centers = np.array(pmt_pulse_centers, dtype=np.int)
-                offsets = pmt_pulse_centers % dt
-                center_index = (pmt_pulse_centers - offsets) / dt   # Absolute index in waveform of pe-pulse center
-                center_index = center_index.astype(np.int)
-
-                if self.config['cheap_zle']:
-                    # For cheap ZLE, define some padding around the cluster
-                    start_index = np.min(center_index) - int(self.config['zle_padding'] / dt)
-                    end_index = max(center_index) + int(self.config['zle_padding'] / dt)
-                else:
-                    # Simulate an event-long waveform in this channel
-                    # Remember start padding has already been added to times, so just one padding in end_index
-                    start_index = 0
-                    end_index = event.length() - 1
-                pulse_length = end_index - start_index + 1
-
-                current_wave = np.zeros(pulse_length)
-
-                if len(center_index) > self.config['use_simplified_simulator_from']:
-
-                    # TODO: Is this actually faster still? Should check!
-
-                    # Start with a delta function single photon pulse, then convolve with one actual single-photon pulse
-                    # This effectively assumes photons always arrive at the start of a digitizer t-bin,
-                    # and also
-                    # but is much faster
-
-                    # Division by dt necessary for charge -> current
-                    unique, counts = np.unique(center_index - start_index, return_counts=True)
-                    unique = unique.astype(np.int)
-                    current_wave[unique] = counts * self.config['gains'][channel] * units.electron_charge / dt
-
-                    # Previous, slow implementation
-                    # pulse_counts = Counter(center_index)
-                    # print(pulse_counts)
-                    # current_wave2 = np.array([pulse_counts[n] for n in range(n_samples)]) \
-                    #                * self.config['gains'][channel] * units.electron_charge / dt
-
-                    # Calculate a normalized pmt pulse, then convolve with it
-                    normalized_pulse = self.pmt_pulse_current(gain=1)
-                    normalized_pulse /= np.sum(normalized_pulse)
-                    current_wave = np.convolve(current_wave, normalized_pulse, mode='same')
-
-                else:
-
-                    # Use a Gaussian truncated to positive values for the SPE gain distribution
-                    gains = truncated_gauss_rvs(
-                        my_mean=self.config['gains'][channel],
-                        my_std=self.config['gain_sigmas'][channel],
-                        left_boundary=0,
-                        right_boundary=float('inf'),
-                        n_rvs=len(pmt_pulse_centers))
-
-                    # Do the full, slower simulation for each single-photon pulse
-                    for i, _ in enumerate(pmt_pulse_centers):
-
-                        # Add some current for this photon pulse
-                        # Compute the integrated pmt pulse at various samples, then
-                        # do their diffs/dt
-                        generated_pulse = self.pmt_pulse_current(gain=gains[i], offset=offsets[i])
-
-                        # +1 due to np.diff in pmt_pulse_current   #????
-                        left_index = center_index[i] - start_index + 1
-                        left_index -= int(self.config['samples_before_pulse_center'])
-                        righter_index = center_index[i] - start_index + 1
-                        righter_index += int(self.config['samples_after_pulse_center'])
-
-                        # Debugging stuff
-                        if len(generated_pulse) != righter_index - left_index:
-                            raise RuntimeError(
-                                "Generated pulse is %s samples long, can't be inserted between %s and %s" % (
-                                    len(generated_pulse), left_index, righter_index))
-
-                        if left_index < 0:
-                            raise RuntimeError("Invalid left index %s: can't be negative!" % left_index)
-
-                        if righter_index >= len(current_wave):
-                            raise RuntimeError("Invalid right index %s: can't "
-                                               "be longer than length of wave "
-                                               "(%s)!" % (righter_index,
-                                                          len(current_wave)))
-
-                        current_wave[left_index: righter_index] += generated_pulse
-
-                # Did you order some Gaussian current noise with that?
-                if self.config['gaus_noise_sigma']:
-                    # / dt is for charge -> current conversion, as in pmt_pulse_current
-                    noise_sigma_current = self.config['white_noise_sigma'] * self.config['gains'][channel] / dt,
-                    current_wave += np.random.normal(0,
-                                                     noise_sigma_current,
-                                                     len(current_wave))
-
-                # Convert from PMT current to ADC counts
-                adc_wave = current_wave
-                adc_wave *= self.config['pmt_circuit_load_resistor']    # Now in voltage
-                adc_wave *= self.config['external_amplification']       # Now in voltage after amplifier
-                adc_wave /= dV                                          # Now in float ADC counts above baseline
-                adc_wave = np.trunc(adc_wave)                           # Now in integer ADC counts "" ""
-                # Could round instead of trunk... who cares?
-
-                # PMT signals are negative excursions, so flip them.
-                adc_wave = - adc_wave
-
-                # Did you want to superpose onto real noise samples?
-                if self.config['real_noise_file']:
-                    sample_size = self.config['real_noise_sample_size']
-                    available_noise_samples = self.noise_data.shape[1] / sample_size
-                    needed_noise_samples = int(math.ceil(pulse_length / sample_size))
-                    chosen_noise_sample_numbers = np.random.randint(0,
-                                                                    available_noise_samples - 1,
-                                                                    needed_noise_samples)
-                    # Extract the chosen noise samples and concatenate them
-                    # Have to use a listcomp here, unless you know a way to select multiple slices in numpy?
-                    #  -- yeah making an index list with np.arange would work, but honestly??
-                    real_noise = np.concatenate([
-                        self.noise_data[channel + self.channel_offset][nsn * sample_size:(nsn + 1) * sample_size]
-                        for nsn in chosen_noise_sample_numbers
-                    ])
-                    adc_wave += real_noise[:pulse_length]
-
-                else:
-                    # If you don't want to superpose onto real noise,
-                    # we should add a reference baseline
-                    adc_wave += self.config['digitizer_reference_baseline']
-
-                # Digitizers have finite number of bits per channel, so clip the signal.
-                adc_wave = np.clip(adc_wave, 0, 2 ** (self.config['digitizer_bits']))
-
-                event.pulses.append(datastructure.Pulse(
-                    channel=channel,
-                    left=start_index,
-                    raw_data=adc_wave.astype(np.int16)))
-
-        if len(event.pulses) == 0:
-            return None
-
-        log.debug("Simulated pax event of %s samples length and %s pulses "
-                  "created." % (event.length(), len(event.pulses)))
-        return event
-
-
-class SimulatedHitpattern(object):
-
-    def __init__(self, config, photon_timings):
-        self.config = config
-        # TODO: specify x, y, z, let photon distribution depend on it
-
-        if not len(photon_timings):
-            raise ValueError('Need at least 1 photon timing to '
-                             'produce a valid hitpattern')
-
-        # Correct for PMT TTS
-        photon_timings += np.random.normal(
-            self.config['pmt_transit_time_mean'],
-            self.config['pmt_transit_time_spread'],
-            len(photon_timings)
-        )
-
-        # The number of pmts which can receive a photon
-        ch_for_photons = self.config['channels_for_photons']
-        n_channels = len(ch_for_photons)
-
-        if n_channels == 1:
-            photons_per_channel = [photon_timings]
+            # The bottom photons are distributed randomly
+            hitp += self.randomize_photons_over_channels(n_photons - n_top, channels=self.config['channels_bottom'])
+            return hitp
 
         else:
+            # Use the S1 pattern information
+            if not self.s1_patterns:
+                return self.randomize_photons_over_channels(n_photons, self.config['channels_in_detector']['tpc'])
+            return self.distribute_photons_by_pattern(n_photons, self.s1_patterns, (x, y, z))
 
-            # First shuffle all timings in the array, so channel 1 doesn't always
-            # get the first photon
-            np.random.shuffle(photon_timings)
+    def distribute_photons_by_pattern(self, n_photons, pattern_fitter, coordinate_tuple):
+        # TODO: assumes channels drawn from top, or from all channels (i.e. first index 0!!!)
+        # Note a CoordinateOutOfRange exception can be raised if points outside the TPC radius are asked
+        # We don't catch it here: users shouldn't ask for simulations of impossible things :-)
+        lces = pattern_fitter.expected_pattern(coordinate_tuple)
+        return self.randomize_photons_over_channels(n_photons,
+                                                    channels=range(len(lces)),
+                                                    relative_lce_per_channel=lces)
 
-            # Now generate n_channels integers < n_channels to denote the splitting
-            # points
-            # TODO: think carefully about these +1 and -1's Without the +1 S1sClose
-            # failed
-            split_points = np.sort(np.random.randint(0,
-                                                     len(photon_timings) + 1,
-                                                     n_channels - 1))
+    def randomize_photons_over_channels(self, n_photons, channels=None, relative_lce_per_channel=None):
+        """Distribute photon_timings over channels according to relative_lce_per_channel
 
-            # Split the array according to the split points
-            # numpy correctly inserts empty arrays if a split point occurs twice if split_points is sorted
-            photons_per_channel = np.split(photon_timings,
-                                           split_points)
+        :param n_photons: number of photons to distribute
+        :param channels: list of channel numbers that can receive photons. This will still be filtered
+         to include only channels in self.config['channels_for_photons'].
+        :param relative_lce_per_channel: list of relative lce per channel. Should all be >= 0.
+                                         If omitted, will distribute photons uniformly over channels.
+                                         Does not have to be normalized to sum to 1.
+        :return: array of length sim.config['n_channels'] with photon counts per channel
+        """
+        if n_photons == 0:
+            return np.zeros(self.config['n_channels'], dtype=np.int64)
 
-            # This distributes stuff in some pattern, favouring the center... odd
-            # So: shuffle to randomize the photon distribution
-            np.random.shuffle(photons_per_channel)
+        # Include only channels that can receive photons
+        if channels is None:
+            channels = np.array(self.config['channels_for_photons'])
+        else:
+            channels = np.array(channels)
+            sel = np.in1d(channels, self.config['channels_for_photons'])
+            channels = channels[sel]
+            if relative_lce_per_channel is not None:
+                relative_lce_per_channel = relative_lce_per_channel[sel]
 
-        # Check we have not generated any photons or lost any
-        # assert sum(list(map(len, photons_per_channel))) == len(photon_timings)
+        # Ensure relative LCEs are valid, and sum to one (among the remaining channels):
+        if relative_lce_per_channel is not None:
+            relative_lce_per_channel = np.clip(relative_lce_per_channel, 0, 1)
+            relative_lce_per_channel /= np.sum(relative_lce_per_channel)
 
-        # Merge the result in a dictionary, which we return
-        # TODO: zip can probably do this faster!
-        self.arrival_times_per_channel = {ch_for_photons[i]: photons_per_channel[i] for i in range(n_channels)}
+        # Generate a channel index for every photon
+        channel_index_for_p = np.random.choice(channels, size=n_photons, p=relative_lce_per_channel)
 
-        # Add the minimum and maximum times, and number of times
-        # hitlist_to_waveforms would have to go through weird flattening stuff to determine these
-        self.min = min(photon_timings)
-        self.max = max(photon_timings)
-        self.n_photons = len(photon_timings)
+        # Count number of photons in each channel
+        # Note the histogram range must include n_channels, even though n_channels-1 is the maximum value
+        # This is because of how numpy handles values on bin edges
+        hitp, _ = np.histogram(channel_index_for_p,
+                               bins=self.config['n_channels'], range=(0, self.config['n_channels']))
 
-    def __add__(self, other):
-        # Don't reuse __init__, we don't want another TTS correction..
-        # TODO: hm, maybe we shouldn't do TTS correction here?
-        # print("add called self=%s, other=%s" % (type(self), type(other)))
-        self.min = min(self.min, other.min)
-        self.max = max(self.max, other.max)
-        self.n_photons = self.n_photons + other.n_photons
-        contributing_channels = set(self.arrival_times_per_channel.keys()) | set(other.arrival_times_per_channel.keys())
-        self.arrival_times_per_channel = {
-            ch: np.concatenate((
-                self.arrival_times_per_channel.get(ch,  np.array([])),
-                other.arrival_times_per_channel.get(ch, np.array([]))
-            ))
-            for ch in contributing_channels
-        }
-        return self
-
-    def __radd__(self, other):
-        # print("radd called self=%s, other=%s" % (type(self), type(other)))
-        if other is 0:
-            # Apparently sum() starts trying to add stuff to 0...
-            return self
-        self.__add__(other)
+        if not len(hitp) == self.config['n_channels']:
+            raise RuntimeError("You found a simulator bug!\n"
+                               "Hitpattern has wrong length "
+                               "(%d, should be %d)" % (len(hitp), len(channels)))
+        if not np.sum(hitp) == n_photons:
+            raise RuntimeError("You found a simulator bug!\n"
+                               "Hitpattern has wrong number of photons "
+                               "(%d, should be %d)" % (np.sum(hitp), n_photons))
+        return hitp
 
 
 ##
 # Photon pulse generation
 ##
 
-# I pulled this out of Simulator: caching using Memoize gave me trouble on methods due to the self argument
+# I pulled this out of the Simulator class: caching using Memoize gave me trouble on methods due to the self argument
 # There's still a method pmt_pulse_current, but it just calls pmt_pulse_current_raw defined below
 
 @Memoize
@@ -586,8 +653,13 @@ def exp_pulse(t, q, tr, tf):
         return q / (tr + tf) * (tr + tf * (1 - math.exp(-t / (c * tf))))
 
 
+##
+# PMT gain sampling
+##
+
 @Memoize
 def _truncated_gauss(my_mean, my_std, left_boundary, right_boundary):
+    """NB: the mean & std are only used to fix the boundaries, this is still a standardized normal otherwise!"""
     return stats.truncnorm(
         (left_boundary - my_mean) / my_std,
         (right_boundary - my_mean) / my_std)

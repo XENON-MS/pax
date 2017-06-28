@@ -1,336 +1,287 @@
 #!/usr/bin/env python
 """ Processor for Analyzing XENON - command line interface
 
-This is the main entry point for running standalone pax.  You can configure via
-the command line most operations for running with pax.  Typically, you'll
-specify a configuration via the --config command line argument.
+This is the main entry point for running pax.  It allow you to configure a few simple options operations
+for running with pax  can configure viathe command line.
+Typically, you'll specify a configuration via the --config command line argument.
+For more control, you want to make your own configuration file and load it with --config_path your_config.ini
 """
-
 import argparse
 import os
 import sys
-import copy
-import json
-import queue
-import multiprocessing
+from collections import OrderedDict
 
-from pax import core, utils
+# Hack to ensure correct matplotlib backend is chosen
+# Without this, pax's plotting does not work when using a system without a graphical display
+# Stolen from http://stackoverflow.com/questions/8257385/automatic-detection-of-display-availability-with-matplotlib
+import matplotlib
+if os.name != 'nt' and not os.environ.get('DISPLAY'):
+    matplotlib.use('Agg')
 
-
-class BaseProcess(multiprocessing.Process):
-
-    """Base class for starting pax threads
-    """
-
-    def __init__(self, task_queue, result_queue,
-                 input_done, process_done, output_done,
-                 config_names, config_path, config_dict):
-        multiprocessing.Process.__init__(self)
-
-        # Queues for feeding events in and out
-        self.task_queue = task_queue
-        self.result_queue = result_queue
-
-        # Multiprocessing 'Events'. These are booleans that indicated whether
-        # each stage has finished.
-        self.input_done = input_done
-        self.process_done = process_done
-        self.output_done = output_done
-
-        # pax configuations
-        self.config_names = config_names
-        self.config_path = config_path
-        self.config_dict = config_dict
-
-    def run(self):
-        # Defined in subclass
-        raise NotImplementedError()
-
-
-class ProcessorEvents(BaseProcess):
-
-    """Thread for processing single events
-
-    This thread will be fed via the task queue and report its results via the
-    result queue.  It will initialize its own 'pax' Processor instance.  It
-    waits until it has received a 'poisson pill', which tells it to shut down.
-    """
-
-    def run(self):
-        # Initialize pax instance
-        p = core.Processor(config_names=self.config_names,
-                           config_paths=self.config_path,
-                           config_dict=self.config_dict)
-
-        # Loop until a 'poisson pill' found (next_events == None)
-        while True:
-            next_events = self.task_queue.get()
-            answer = []
-            if next_events is None:  # Poison pill of None means shutdown
-                p.log.info('Exiting')
-                p.shutdown()
-                self.task_queue.task_done()
-                break
-
-            # If not None, means these are events to process
-            for event in next_events:
-                answer.append(p.process_event(event))
-
-            # Notify queue that these events processed
-            self.task_queue.task_done()
-
-            # Put output to result queue to await being picked up by Output
-            # thread
-            self.result_queue.put(answer)
-
-        return
-
-
-class OutputEvents(BaseProcess):
-
-    """Thread for writing events to disk
-
-    Typically, there should only be one Output instance since often output
-    operations are not parallelizable.
-    """
-
-    def run(self):
-        # Initialize pax instance
-        p = core.Processor(config_names=self.config_names,
-                           config_paths=self.config_path,
-                           config_dict=self.config_dict)
-
-        #  Wait until can_end == True
-        while True:
-            # Need to check if we can end before we fetch events because
-            # of the race condition where input and processing are done, but
-            # there are still events left in the results queue waiting to be
-            # processed
-            can_end = self.input_done.is_set() and self.process_done.is_set()
-
-            # Useful statistics
-            print('input_done:', self.input_done.is_set(),
-                  'process_done:', self.process_done.is_set(),
-                  'output_done:', self.output_done.is_set(),
-                  'blocks waiting input:', self.task_queue.qsize(),
-                  'blocks waiting output:', self.result_queue.qsize())
-
-            try:
-                # Get events, or raise queue.Empty if timed out
-                next_events = self.result_queue.get(block=True,
-                                                    timeout=1)  # second
-
-                # If events, write them to output
-                for event in next_events:
-                    p.process_event(event)
-
-                # Tell result queue that events processed
-                self.result_queue.task_done()
-            except queue.Empty:
-                # If queue is empty, and input and processing done, then exit
-                # the while loop.
-                if can_end:
-                    self.output_done.set()
-                    p.shutdown()
-                    break
-
-        return
+# These imports must be after matplotlib.use, otherwise the backend is already chosen
+# (so which of them is actually importing matplotlib.pyplot??)
+import pax    # flake8: noqa
+from pax import core, utils, formats    # flake8: noqa
 
 
 def main():
-    args = get_args()
+    input_plugin_aliases, output_plugin_aliases = get_aliases()
+    parser = get_argsparser(input_plugin_aliases, output_plugin_aliases)
+    args = parser.parse_args()
 
-    # Compute numbers of CPUs that can be used
-    max_cpus = multiprocessing.cpu_count()
-    if args.cpus == 'all':
-        args.cpus = max_cpus
-    else:
-        args.cpus = int(args.cpus)
+    if args.version:
+        print(pax.__version__)
+        exit()
 
-    # (if requested) Take config from previous file
-    if args.redo:
-        from pandas import HDFStore
+    if not (args.config or args.config_path):
+        print("You did not specify any configuration!")
+        parser.print_usage()
+        exit()
 
-        file_to_redo = core.data_file_name(args.redo)
-        store = HDFStore(file_to_redo)
-
-        if len(store['pax_info']) > 1:
-            print("Warning: This file contains data from several processings. "
-                  "Will use config from last!\n")
-        override_dict = json.loads(store['pax_info'].iloc[-1]['configuration_json'])
-
-        # Add _redone to output name, unless user has specified an output name
-        if not args.output:
-            redo_path, ext = os.path.splitext(args.redo)  # Remove .hdf from path
-            redo_path += '_redone'
-            print("Output path of redone processing not specified: will "
-                  "write to %s\n" % redo_path)
-            args.output = redo_path
-        store.close()
-    else:
-        override_dict = {'pax': {}}
+    override_dict = {'pax': {}}
 
     # Feed certain command line args into pax configuration format
-    for argname, configname in (('input',      'input_name'),
-                                ('output',     'output_name'),
-                                ('log',        'logging_level'),
-                                ('stop_after', 'stop_after'),
-                                ('event',      'events_to_process')):
+    for argname, configname in (('input',       'input_name'),
+                                ('output',      'output_name'),
+                                ('cpus',        'n_cpus'),
+                                ('log',         'logging_level'),
+                                ('stop_after',  'stop_after'),
+                                ('event',       'events_to_process'),
+                                ('event_numbers_file', 'event_numbers_file'),):
         value = getattr(args, argname)
         if value is not None:
             override_dict['pax'][configname] = value
 
+    # Process input type options
+    if args.input_type is not None:
+        override_dict['pax']['input'] = []
+        for pa in wraplist(args.input_type):
+            bla = input_plugin_aliases[pa]
+            decoder = None
+            if isinstance(bla, tuple):
+                if isinstance(bla[1], dict):
+                    # We have a plugin name, extra options tuple
+                    plugin_name, override_dict[plugin_name] = bla
+                else:
+                    # We have two plugins, the second is the decoder
+                    plugin_name, decoder = bla
+            else:
+                plugin_name = bla
+            override_dict['pax']['input'].append(plugin_name)
+            override_dict['pax']['decoder_plugin'] = decoder
+
+    # Process output type options. Code is almost the same... sorry!
+    if args.output_type is not None:
+        override_dict['pax']['output'] = []
+        for pa in wraplist(args.output_type):
+            bla = output_plugin_aliases[pa]
+            encoder = None
+            if isinstance(bla, tuple):
+                if isinstance(bla[1], dict):
+                    # We have a plugin name, extra options tuple
+                    plugin_name, override_dict[plugin_name] = bla
+                else:
+                    # We have two plugins, the first is the encoder
+                    encoder, plugin_name = bla
+            else:
+                plugin_name = bla
+            override_dict['pax']['encoder_plugin'] = encoder
+            override_dict['pax']['output'].append(plugin_name)
+
     # Overrides for plotting
-    if args.plot_to_dir or args.plot:
-        override_dict['pax']['output'] = 'Plotting.PlotEventSummary'
+    if args.plot_to_dir or args.plot or args.plot_interactive:
+        override_dict['pax']['output_name'] = 'SCREEN'
+        override_dict['pax']['pre_output'] = []    # Avoid dumping the stuff we want to plot!
+        override_dict['pax']['encoder_plugin'] = None
+        if args.plot:
+            override_dict['pax']['output'] = 'Plotting.PlotEventSummary'
         if args.plot_to_dir:
-            override_dict['Plotting.PlotEventSummary'] = {'output_dir': args.plot_to_dir}
+            override_dict['pax']['output'] = 'Plotting.PlotEventSummary'
+            override_dict['pax']['output_name'] = args.plot_to_dir
+        if args.plot_interactive:
+            override_dict['pax']['output'] = 'Plotting.PeakViewer'
 
-    ##
-    # Single-core processing
-    ##
-    if args.cpus == 1:
-        pax_instance = core.Processor(config_names=args.config,
-                                      config_paths=args.config_path,
-                                      config_dict=override_dict)
+    # Format the config string
+    config_str = args.config_string
+    config_str = config_str.replace(']', ']\n')
+    config_str = config_str.replace(';', '\n')
 
-        try:
-            pax_instance.run()
-        except (KeyboardInterrupt, SystemExit):
-            print("\nShutting down all plugins...")
-            pax_instance.shutdown()
-            print("Exiting")
-            sys.exit()
-    else:  # Parallel processing
-        if os.name == 'nt':
-            raise NotImplementedError("Pax parallelization is not supported "
-                                      "under Windows (due to lack of fork).")
+    pax_instance = core.Processor(config_names=args.config,
+                                  config_paths=args.config_path,
+                                  config_string=config_str,
+                                  config_dict=override_dict)
 
-        override_dict['pax']['plugin_group_names'] = ['input']
-        p = core.Processor(config_names=args.config,
-                           config_paths=args.config_path,
-                           config_dict=copy.deepcopy(override_dict))
-
-        override_dict['pax']['plugin_group_names'] = ['dsp', 'transform']
-
-        # Keep track of processing state that threads can see
-        input_done = multiprocessing.Event()
-        process_done = multiprocessing.Event()
-        output_done = multiprocessing.Event()
-
-        # Establish communication queues
-        tasks = multiprocessing.JoinableQueue()
-        results = multiprocessing.JoinableQueue()
-
-        # Start consumers
-        num_consumers = args.cpus
-        p.log.info('Creating %d consumers',
-                   num_consumers)
-        consumers = [ProcessorEvents(tasks, results,
-                                     input_done, process_done, output_done,
-                                     args.config,
-                                     args.config_path,
-                                     config_dict=copy.deepcopy(override_dict)) for _ in range(num_consumers)]
-
-        override_dict['pax']['plugin_group_names'] = ['output']
-        consumer_output = OutputEvents(tasks, results,
-                                       input_done, process_done, output_done,
-                                       args.config,
-                                       args.config_path,
-                                       config_dict=copy.deepcopy(override_dict))
-
-        # Start all worker threads
-        for w in consumers + [consumer_output]:
-            w.start()
-
-        # Enqueue jobs
-        events = []
-        n = 10  # chunk in threads (TODO: what is best n?)
-
-        for event in p.get_events():
-            events.append(event)
-            if len(events) > n:
-                tasks.put(events)
-                events = []
-
-        # If anything left over
-        if len(events):
-            tasks.put(events)
-        p.shutdown()
-
-        # Input stage done
-        input_done.set()
-
-        # Put poison pills to tell thread to quit
-        for i in range(num_consumers):
-            tasks.put(None)
-
-        print("Wait for consumers to finish")
-        tasks.join()  # blocks until processing done
-
-        process_done.set()  # processing done
-
-        output_done.wait()  # wait until output done
-        print("All events processed.  Exiting...")
+    try:
+        pax_instance.run()
+    except (KeyboardInterrupt, SystemExit):
+        print("\nShutting down all plugins...")
+        pax_instance.shutdown()
+        print("Exiting")
+        sys.exit()
 
 
-def get_args():
+def get_argsparser(input_plugin_aliases, output_plugin_aliases):
     """Process command line arguments"""
-    parser = argparse.ArgumentParser(description="Process XENON data")
-    parser.add_argument('--input', default=None,
-                        help="File, database or directory to read events from",
-                        nargs='?')
-    parser.add_argument('--output', default=None,
-                        help="File, database or directory to write events to",
-                        nargs='?')
-    # Parallelization control
+    parser = argparse.ArgumentParser(description="Processor for XENON data",
+                                     epilog="""For more information, please see the pax documentation at
+                                               http://xenon1t.github.io/pax/ or the pax development site at
+                                               https://github.com/XENON1T/pax.""")
+
+    # Basics
+    parser.add_argument('--version',  action='store_true',
+                        help="Print current pax version, then exit")
     parser.add_argument('--cpus', default=1,
-                        help="Number of CPUs to use. Default is 1; can be "
-                             "'all'.",
+                        help="Number of CPUs to use. Default is 1; can be 'all'.",
                         nargs='?')
-    # Log level control
     parser.add_argument('--log', default=None,
                         help="Set log level, e.g. 'debug'")
+
+
+    # Input and output control
+    io_group = parser.add_argument_group(title='Input/output')
+    io_group.add_argument('--input', default=None,
+                          help="File, database or directory to read events from.",)
+    io_group.add_argument('--output', default=None,
+                          help="File, database or directory to write events to. "
+                               "If omitted, will try to construct one from input name or timestamp. "
+                               "For plotting to screen, use SCREEN.")
+
+    output_type_options = list(reversed(sorted(output_plugin_aliases.keys())))
+    io_group.add_argument('--output_type',
+                          nargs='+', choices=output_type_options,
+                          help='Output format/plugin(s) to use. '
+                               'Should be a space-separated list; allowed values are: ' +
+                               ', '.join(output_type_options) + '.\n' +
+                               'Use with --config reduce_raw_data if you want to write raw data!',
+                          metavar='OUTPUT_TYPE',
+                          )
+    input_type_options = list(reversed(sorted(input_plugin_aliases.keys())))
+    io_group.add_argument('--input_type',
+                          choices=input_type_options,
+                          help='Input format/plugin to use. '
+                               'Allowed values are: ' +
+                               ', '.join(input_type_options) + '.\n' +
+                               'Use with --config Reprocess if you want to read processed data!',
+                          metavar='INPUT_TYPE',)
+
     # Configuration control
     # Pass in a name to use a pre-cooked config from config:
-    parser.add_argument('--config',
-                        default='XENON100',
-                        choices=utils.get_named_configuration_options(),
-                        nargs='+',
-                        help="Name(s) of the pax configuration(s) to use.")
-    # ... or pass in a path to your own config file:
-    parser.add_argument('--config_path',
-                        default=[],
-                        nargs='+',
-                        help="Path(s) of the configuration file(s) to use."
-                        )
-    # ... or load the configuration from a previous processed data file
-    parser.add_argument('--redo',
-                        default='',
-                        help="Path of the HDF5 data file to redo."
-                        )
+    config_group = parser.add_argument_group(title='Configuration')
+    config_options = utils.get_named_configuration_options()
+    config_group.add_argument('--config',
+                              choices=config_options,
+                              default=[],
+                              nargs='+',
+                              metavar='CONFIG',
+                              help="Name(s) of the pax configuration(s) to use. "
+                                   "Should be a space-separated list; allowed-values are: " +
+                                   ', '.join(config_options))
+    # ... or a path to your own config file:
+    config_group.add_argument('--config_path',
+                              default=[],
+                              nargs='+',
+                              help="Path(s) of the configuration file(s) to use.")
+    config_group.add_argument('--config_string', default='',
+                              help="String specifying additional configuration options. Semicolons become newlines.\n"
+                                   "For example: '[WaveformSimulator]event_repetitions=2;electron_lifetime=50*us'")
+
+    # Control events to process
+    event_group = parser.add_argument_group(title='Event specification')
+    event_group.add_argument('--event',
+                             type=int,
+                             nargs='+',
+                             help="Process particular event number(s).")
+    event_group.add_argument('--event_numbers_file',
+                             type=str,
+                             help="Name of file containing newline-separated event number(s) to process.")
+    event_group.add_argument('--stop_after',
+                             type=int,
+                             help="Stop after STOP_AFTER events have been processed.")
+
     # Plotting override
     plotting_control_group = parser.add_mutually_exclusive_group()
     plotting_control_group.add_argument('--plot',
                                         action='store_const',
                                         const=True,
-                                        help='Plot summed waveforms on screen',
-                                        )
+                                        help='Plot summed waveforms on screen. '
+                                             'Equivalent to --output_type plot --output SCREEN.')
+    plotting_control_group.add_argument('--plot_interactive',
+                                        action='store_const',
+                                        const=True,
+                                        help='Plot interactive peak browser on screen. '
+                                             'Equivalent to --output_type plot_interactive --output SCREEN.')
     plotting_control_group.add_argument('--plot_to_dir',
-                                        help='Save summed waveform plots in '
-                                             'directory',
-                                        )
-    # Control events to process
-    parser.add_argument('--event',
-                        type=int,
-                        nargs='+',
-                        help="Process particular event(s).")
-    parser.add_argument('--stop_after',
-                        type=int,
-                        help="Stop after STOP_AFTER events have been processed.")
-    args = parser.parse_args()
-    return args
+                                        help='Save summed waveform plots in directory. '
+                                             'Equivalent to --output_type plot --output your_directory.')
 
+    return parser
+
+
+def get_aliases():
+    # Make the output plugin aliases
+    # Don't know yet if we want to display these ordered lexically or conceptually in --help:
+    # work with an ordereddict to store the conceptual order in case we change our minds
+    output_plugin_aliases = OrderedDict([
+        ('none',  'Dummy.DummyOutput'),
+        ('plot',  'Plotting.PlotEventSummary'),
+        ('plot_interactive',  'Plotting.PeakViewer'),
+    ])
+    # Add output aliases from TableWriter formats
+    output_plugin_aliases.update([(fc, ('Table.TableWriter', {'output_format': fc}))
+                                  for fc in formats.flat_data_formats.keys()])
+    output_plugin_aliases.update([
+        ('root',         ('ROOTClass.EncodeROOTClass', 'ROOTClass.WriteROOTClass')),
+
+        # Zipped formats -- allow arbitrary event numbering
+        ('zpickle', ('Pickle.EncodeZPickle', 'Zip.WriteZipped')),
+        ('zbson',   ('BSON.EncodeZBSON', 'Zip.WriteZipped')),
+
+        # Non-zipped formats
+        ('json',  'BSON.WriteJSON'),
+        ('xed',   'XED.WriteXED'),
+
+        # Formats that don't have a plugin to read data back
+        ('raw_dump',     'RawWaveformDump.DumpSumWaveformToBinary'),
+        ('mongo',        'Mongo.MongoDBWriteTriggered'),
+    ])
+
+    input_plugin_aliases = OrderedDict([
+        ('none',  'Dummy.DummyInput'),
+        ('xed',      ('XED.ReadXED', 'XED.DecodeXED')),
+
+        # Zipped formats
+        ('zbson',   ('Zip.ReadZipped', 'BSON.DecodeZBSON')),
+        ('zpickle', ('Zip.ReadZipped', 'Pickle.DecodeZPickle')),
+
+        # Nonzipped formats
+        ('json',    'BSON.ReadJSON'),
+    ])
+    input_plugin_aliases.update([(fc, ('Table.TableReader', {'format': fc}))
+                                 for fc in formats.flat_data_formats.keys()])
+    input_plugin_aliases.update([
+        # Simulator input formats shouldn't be here: if you load simulated events you want a different config as well,
+        # so you still want to use the Simulator ini file.
+
+        # ROOT
+        ('root',     'ROOTClass.ReadROOTClass'),
+
+        # Mongo
+        ('mongo_untriggered', 'MongoDBReadUntriggered'),
+        ('mongo_untriggered', 'MongoDBReadUntriggered'),
+    ])
+
+    return input_plugin_aliases, output_plugin_aliases
+
+
+def wraplist(x):
+    """Returns [x] if x is a string or not iterable, returns x otherwise"""
+    if isinstance(x, str):
+        return [x]
+    try:
+        x[0]
+    except TypeError:
+        return [x]
+    return x
 
 if __name__ == "__main__":
     main()

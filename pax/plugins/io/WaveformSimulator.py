@@ -8,14 +8,40 @@ import os
 import csv
 
 import numpy as np
-
 import pandas
+
 from pax import plugin, units, utils
 
 
-class WaveformSimulator(plugin.InputPlugin):
+def uniform_circle_rv(radius, n_samples=None):
+    """Sample n_samples from x,y uniformly in a circle with radius"""
+    if n_samples is None:
+        just_give_one = True
+        n_samples = 1
+    else:
+        just_give_one = False
 
-    """ Common I/O for waveform simulator plugins
+    xs = []
+    ys = []
+
+    for sample_i in range(n_samples):
+        while True:
+            x = np.random.uniform(-radius, radius)
+            y = np.random.uniform(-radius, radius)
+            if x**2 + y**2 <= radius**2:
+                break
+        xs.append(x)
+        ys.append(y)
+
+    if just_give_one:
+        return xs[0], ys[0]
+    else:
+        return xs, ys
+
+
+class WaveformSimulator(plugin.InputPlugin):
+    """Common input plugin for waveform simulator plugins. Do not use directly, won't work.
+    Takes care of truth file writing as well.
     """
 
     def startup(self):
@@ -26,7 +52,7 @@ class WaveformSimulator(plugin.InputPlugin):
     def shutdown(self):
         self.log.debug("Write the truth peaks to %s" % self.config['truth_file_name'])
         output = pandas.DataFrame(self.all_truth_peaks)
-        output.to_csv(self.config['truth_file_name'])
+        output.to_csv(self.config['truth_file_name'], index_label='fax_truth_peak_id')
 
     def store_true_peak(self, peak_type, t, x, y, z, photon_times, electron_times=()):
         """ Saves the truth information about a peak (s1 or s2)
@@ -59,15 +85,16 @@ class WaveformSimulator(plugin.InputPlugin):
                 })
         self.truth_peaks.append(true_peak)
 
-    def s2(self, electrons, t=0., z=0., x=0., y=0.):
+    def s2(self, electrons, t=0., x=0., y=0., z=0.):
         electron_times = self.simulator.s2_electrons(electrons_generated=electrons, t=t, z=z)
         if not len(electron_times):
             return None
-        photon_times = self.simulator.s2_scintillation(electron_times)
+        photon_times = self.simulator.s2_scintillation(electron_times, x, y)
         if not len(photon_times):
             return None
         self.store_true_peak('s2', t, x, y, z, photon_times, electron_times)
-        return self.simulator.make_hitpattern(photon_times)
+        # Generate S2 hitpattern "at the anode": cue for  simulator to use the S2 LCE map
+        return self.simulator.queue_signal(photon_times, x, y, z=-self.config['gate_to_anode_distance'])
 
     def s1(self, photons, recoil_type, t=0., x=0., y=0., z=0.):
         """
@@ -77,44 +104,117 @@ class WaveformSimulator(plugin.InputPlugin):
                 Defaults to s1_default_recombination_time.
         :return: start_time, channel_waveforms
         """
-        photon_times = self.simulator.s1_photons(photons, recoil_type, t)
+        photon_times = self.simulator.s1_photons(photons, recoil_type, x, y, z, t)
         if not len(photon_times):
             return None
         self.store_true_peak('s1', t, x, y, z, photon_times)
-        return self.simulator.make_hitpattern(photon_times)
+        return self.simulator.queue_signal(photon_times, x=x, y=y, z=z)
+
+    def s2_after_pulses(self):
+        """
+        :simulate the s2 after pulses
+        :the after pulses are assumed to be uniformly distributed in X-Y,
+        :so are not related to where the photon is generated
+        :We simplify the generation, assuming S2-after pulses
+        :will not further generate secondary s2 after pulses
+        """
+        photon_detection_times = []
+        # join all the photon detection times in channels
+        for channel_id, single_channel_photon_detection_times \
+                in self.simulator.arrival_times_per_channel.items():
+            photon_detection_times.extend(
+                np.array(single_channel_photon_detection_times)
+                )
+        # generate the s2 after pulses for each type
+        s2_ap_electron_times = []
+        for s2_ap_data in self.config['s2_afterpulse_types'].values():
+            # calculate how many s2 after pulses
+            num_s2_afterpulses = np.random.binomial(
+                n=len(photon_detection_times),
+                p=s2_ap_data['p']
+                )
+            if num_s2_afterpulses == 0:
+                continue
+            # Find the time delay of the after pulses
+            dist_kwargs = s2_ap_data['time_parameters']
+            dist_kwargs['size'] = num_s2_afterpulses
+            s2_ap_electron_times.extend(
+                np.random.choice(
+                    photon_detection_times, size=num_s2_afterpulses,
+                    replace=False) +
+                getattr(
+                    np.random,
+                    s2_ap_data['time_distribution'])(**dist_kwargs)
+                )
+        # generate the s2 photons of each s2 pulses one by one
+        # the X-Y of after pulse is randomized, Z is set to 0
+        # randomize an array of X-Y
+        rsquare = np.random.uniform(
+            0,
+            np.power(self.config['tpc_radius'], 2.),
+            len(s2_ap_electron_times)
+            )
+        theta = np.random.uniform(0, 3.141592653, len(s2_ap_electron_times))
+        X = np.sqrt(rsquare)*np.cos(theta)
+        Y = np.sqrt(rsquare)*np.sin(theta)
+        for electron_id, s2_ap_electron_time \
+                in enumerate(s2_ap_electron_times):
+            s2_ap_photon_times = self.simulator.s2_scintillation(
+                [s2_ap_electron_time],
+                X[electron_id],
+                Y[electron_id]
+                )
+            # queue the photons caused by the s2 after pulses
+            self.simulator.queue_signal(
+                s2_ap_photon_times,
+                X[electron_id],
+                Y[electron_id],
+                -self.config['gate_to_anode_distance']
+                )
 
     def get_instructions_for_next_event(self):
         raise NotImplementedError()
 
-    @plugin.BasePlugin._timeit
     def simulate_single_event(self, instructions):
         self.truth_peaks = []
 
-        hitpatterns = []
         for q in instructions:
-            self.log.debug("Simulating %s photons and %s electrons at %s cm depth, at t=%s ns" % (
-                q['s1_photons'], q['s2_electrons'], q['depth'], q['t']
-            ))
-            if int(q['s1_photons']):
-                hitpatterns.append(
-                    self.s1(photons=int(q['s1_photons']), recoil_type=q['recoil_type'], t=float(q['t']))
-                )
-            if int(q['s2_electrons']):
-                hitpatterns.append(
-                    self.s2(
-                        electrons=int(q['s2_electrons']),
-                        z=float(q['depth']) * units.cm,
-                        t=float(q['t'])
-                    )
-                )
+            self.log.debug("Simulating %s photons and %s electrons at %s cm z, at t=%s ns" % (
+                q['s1_photons'], q['s2_electrons'], q['z'], q['t']))
 
-        # Combine the hitpatterns by their overloaded addition operator, then simulate waveforms
-        event = self.simulator.to_pax_event(sum([h for h in hitpatterns if h is not None]))
+            # Should we choose x and yrandomly?
+            if q['x'] == 'random':
+                x, y = uniform_circle_rv(self.config['tpc_radius'])
+            else:
+                x = float(q['x'])
+                y = float(q['y'])
+
+            if q['z'] == 'random':
+                z = - np.random.uniform(0, self.config['tpc_length'])
+            else:
+                z = float(q['z']) * units.cm
+
+            if int(q['s1_photons']):
+                self.s1(photons=int(q['s1_photons']),
+                        recoil_type=q['recoil_type'],
+                        t=float(q['t']), x=x, y=y, z=z)
+
+            if int(q['s2_electrons']):
+                self.s2(electrons=int(q['s2_electrons']),
+                        t=float(q['t']), x=x, y=y, z=z)
+
+        # Based on the generated photon timing
+        # generate the after pulse
+        # currently make it simple, assuming s2 after pulses
+        # will not generate further s2 after pulses.
+        self.s2_after_pulses()
+
+        event = self.simulator.make_pax_event()
         if hasattr(self, 'dataset_name'):
             event.dataset_name = self.dataset_name
         event.event_number = self.current_event
 
-        # Add start time offset to all times in the truth information peak
+        # Add start time offset to all peak start times in the truth file
         # Can't be done at the time of peak creation, it is only known now...
         # TODO: That's no longer true! so fix it
         for p in self.truth_peaks:
@@ -128,20 +228,20 @@ class WaveformSimulator(plugin.InputPlugin):
         return event
 
     def get_events(self):
-
         for instruction_number, instructions in enumerate(self.get_instructions_for_next_event()):
             self.current_instruction = instruction_number
             for repetition_i in range(self.config['event_repetitions']):
                 self.current_repetition = repetition_i
                 self.current_event = instruction_number * self.config['event_repetitions'] + repetition_i
-                self.log.debug('Instruction %s, iteration %s, event number %s' % (
-                    instruction_number, repetition_i, self.current_event))
-                event = self.simulate_single_event(instructions)
-                if event is not None:
-                    yield event
+                self.log.debug('Instruction %s, iteration %s, event number %s' % (instruction_number,
+                                                                                  repetition_i, self.current_event))
+                yield self.simulate_single_event(instructions)
 
 
 class WaveformSimulatorFromCSV(WaveformSimulator):
+    """Simulate waveforms from a csv file with instructions, see:
+        http://xenon1t.github.io/pax/simulator.html#instruction-file-format
+    """
 
     def startup(self):
         """
@@ -161,6 +261,11 @@ class WaveformSimulatorFromCSV(WaveformSimulator):
         instruction_number = 0
         instruction = []
         for p in self.instruction_reader:
+            if p['depth'] == 'random':
+                p['z'] = 'random'
+            else:
+                p['z'] = -1 * float(p['depth'])
+            del p['depth']
             if int(p['instruction']) == instruction_number:
                 # Deposition is part of the previous instruction
                 instruction.append(p)
@@ -186,12 +291,14 @@ class WaveformSimulatorFromCSV(WaveformSimulator):
 
 
 class WaveformSimulatorFromNEST(WaveformSimulator):
+    """Simulate waveforms from GEANT4 ROOT file with NEST-generated S1, S2 information
+    """
 
     variables = (
         # Fax name        #Root name    #Conversion factor (multiplicative)
         ('x',             'Nest_x',     0.1),
         ('y',             'Nest_y',     0.1),
-        ('depth',         'Nest_z',     -0.1),
+        ('z',             'Nest_z',     0.1),
         ('s1_photons',    'Nest_nph',   1),
         ('s2_electrons',  'Nest_nel',   1),
         ('t',             'Nest_t',     10 ** 9),
@@ -199,11 +306,12 @@ class WaveformSimulatorFromNEST(WaveformSimulator):
     )
 
     def startup(self):
+        self.config.setdefault('add_to_z', 0)
         self.log.warning('This plugin is completely untested and will probably crash!')
         filename = self.config['input_name']
         import ROOT
-        f = ROOT.TFile(utils.data_file_name(filename))
-        self.t = f.Get("t1")  # For Xerawdp use T1, for MC t1
+        self.f = ROOT.TFile(utils.data_file_name(filename))
+        self.t = self.f.Get("t1")  # For Xerawdp use T1, for MC t1
         WaveformSimulator.startup(self)
         self.number_of_events = self.t.GetEntries() * self.config['event_repetitions']
 
@@ -218,21 +326,82 @@ class WaveformSimulatorFromNEST(WaveformSimulator):
 
             # Convert to peaks dictionary
             npeaks = len(values[self.variables[0][0]])
-            peaks = []
+            interaction_instructions = []
             for i in range(npeaks):
-                peaks.append({'instruction': event_i})
+                interaction_instructions.append({'instruction': event_i})
                 for (variable_name, _, conversion_factor) in self.variables:
-                    peaks[-1][variable_name] = values[variable_name][i] * conversion_factor
+                    interaction_instructions[-1][variable_name] = values[variable_name][i] * conversion_factor
 
-            for p in peaks:
-                # Subtract depth of gate mesh, see xenon:xenon100:mc:roottree, bottom of page
-                p['depth'] -= 2.15 + 0.25
+            for p in interaction_instructions:
+                # Correct the z-coordinate system
+                p['z'] += self.config['add_to_z']
                 # Fix ER / NR label
                 if p['recoil_type'] != 0:
                     p['recoil_type'] = 'NR'
                 else:
                     p['recoil_type'] = 'ER'
             # Sort by time
-            peaks.sort(key=lambda p: p['t'])
+            interaction_instructions.sort(key=lambda p: p['t'])
 
-            yield peaks
+            yield interaction_instructions
+
+
+class WaveformSimulatorFromOpticalGEANT(WaveformSimulator):
+    """Simulate waveforms from Fabio's GEANT4 optical simulation
+    See:
+        https://xecluster.lngs.infn.it/dokuwiki/doku.php?id=xenon:xenon1t:fvm:waveform_generator
+    Currently just pseudocode, awaiting full implementation.
+    The truth file produced by this input plugin will be empty (as WaveformSimulator.s1 and .s2 never get called)
+    """
+
+    variables = (
+        # Fax name        #Root name    #Conversion factor (multiplicative)
+        ('photon_arriving_times',             'time',     1000000000.),
+        ('photon_hit_pmt_ids',             'pmthitID',     1),
+    )
+
+    def startup(self):
+        import ROOT
+        self.f = ROOT.TFile(self.config['input_name'])
+        if not self.f.IsOpen():
+            raise ValueError(
+                "Cannot open ROOT file %s" % self.config['input_name']
+                )
+        self.t = self.f.Get("events/events")
+        WaveformSimulator.startup(self)
+        self.number_of_events = self.t.GetEntries() * self.config['event_repetitions']
+
+    def get_instructions_for_next_event(self):
+        for event_i in range(self.number_of_events):
+            self.t.GetEntry(event_i)
+            instructions = {}
+            instructions['instruction'] = event_i
+            # fill instructions to look like this:
+            # {[photon_hit_pmt_ids], [photon_arriving_times]}
+            for (
+                    variable_name, root_thing_name,
+                    conversion_factor
+                    ) in self.variables:
+                # get stuff from root
+                # the two variables in this plugin are all vectors
+                values = np.reshape(
+                    getattr(self.t, root_thing_name),
+                    self.t.nsteps
+                    )
+                conversion_factors = [conversion_factor]*self.t.nsteps
+                instructions[variable_name] = [
+                    x*y for x, y in zip(values, conversion_factors)
+                    ]
+            yield instructions
+
+    def simulate_single_event(self, instructions):
+        self.simulator.clear_signals_queue()
+        for (channel, arr_time) in zip(
+                instructions['photon_hit_pmt_ids'],
+                instructions['photon_arriving_times']
+                ):
+            self.simulator.arrival_times_per_channel[channel].append(arr_time)
+        self.s2_after_pulses()
+        event = self.simulator.make_pax_event()
+        event.event_number = self.current_event
+        return event

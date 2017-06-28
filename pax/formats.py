@@ -1,10 +1,13 @@
-"""Input/Output code1 for *processed* data
+"""Input/output code for tabular processed data formats
+Most work has migrated to the pax ROOTClass output format by now -- this is retained for backwards compatibility
+and because csv is nice for debugging.
 
 Here are the definitions of how to serialize our data structure to and from various formats.
 Please be careful when editing this file:
  - Do not add any dependencies (e.g. imports at head of file without try-except), this file has to stay import-able
    even if not all the python modules for all the formats are installed.
  - Do not use python3-specific syntax, this file should be importable by python2 applications.
+   (but in a sense this applies to all of pax, we aim to support python 2 and 3)
 """
 import logging
 import os
@@ -12,20 +15,12 @@ import re
 
 import numpy as np
 
-base_logger = logging.getLogger('BulkOutput')
-
-try:
-    import ROOT   # noqa
-except ImportError:
-    base_logger.warning("pyROOT didn't import - if you use the ROOT format, pax will crash!")
-except SyntaxError:
-    base_logger.warning("pyROOT not made for Python3? - if you use the ROOT format, pax will crash!")
+base_logger = logging.getLogger('TableWriter')
 
 try:
     import pandas
 except ImportError:
     base_logger.warning("You don't have pandas -- if you use any of the pandas formats, pax will crash!")
-
 
 try:
     import h5py
@@ -33,7 +28,7 @@ except ImportError:
     base_logger.warning("You don't have h5py -- if you use the hdf5 format, pax will crash!")
 
 
-class BulkOutputFormat(object):
+class TableFormat(object):
     """Base class for bulk output formats
     """
     supports_append = False
@@ -68,7 +63,7 @@ class BulkOutputFormat(object):
         raise NotImplementedError
 
 
-class NumpyDump(BulkOutputFormat):
+class NumpyDump(TableFormat):
     file_extension = 'npz'
     supports_array_fields = True
     supports_read_back = True
@@ -99,7 +94,7 @@ class NumpyDump(BulkOutputFormat):
         return len(self.f[df_name])
 
 
-class HDF5Dump(BulkOutputFormat):
+class HDF5Dump(TableFormat):
     file_extension = 'hdf5'
     supports_array_fields = True
     supports_write_in_chunks = True
@@ -143,7 +138,7 @@ class HDF5Dump(BulkOutputFormat):
         return self.f[df_name].len()
 
 
-class ROOTDump(BulkOutputFormat):
+class ROOTDump(TableFormat):
     """Write data to ROOT file
 
     Convert numpy structered array, every array becomes a TTree.
@@ -161,6 +156,7 @@ class ROOTDump(BulkOutputFormat):
     # ROOT types, strings are handled seperately!
     root_type = {'float32': '/F',
                  'float64': '/D',
+                 'int16': '/S',
                  'int32': '/I',
                  'int64': '/L',
                  'bool': '/O',
@@ -174,19 +170,24 @@ class ROOTDump(BulkOutputFormat):
                   'C': np.dtype('object')}
 
     def __init__(self, *args, **kwargs):
+        base_logger.warn("The tabular ROOT output is old and may crash!")
+        # Avoid importing ROOT until it is needed
+        import ROOT   # noqa
+        self.ROOT = ROOT
+
         # This line makes sure all TTree objects are NOT owned
         # by python, avoiding segfaults when garbage collecting
-        ROOT.TTree.__init__._creates = False
+        self.ROOT.TTree.__init__._creates = False
         # DON'T use the Python3 super trick here, we want this code to run in python2 as well!
-        BulkOutputFormat.__init__(self, *args, **kwargs)
+        TableFormat.__init__(self, *args, **kwargs)
 
     def open(self, name, mode):
         if mode == 'w':
-            self.f = ROOT.TFile(name, "RECREATE")
+            self.f = self.ROOT.TFile(name, "RECREATE")
             self.trees = {}
             self.branch_buffers = {}
         elif mode == 'r':
-            self.f = ROOT.TFile(name)
+            self.f = self.ROOT.TFile(name)
         else:
             raise ValueError("Invalid mode")
 
@@ -199,7 +200,7 @@ class ROOTDump(BulkOutputFormat):
             # Create tree first time write data is called
             if treename not in self.trees:
                 self.log.debug("Creating tree: %s" % treename)
-                self.trees[treename] = ROOT.TTree(treename, treename)
+                self.trees[treename] = self.ROOT.TTree(treename, treename)
                 self.branch_buffers[treename] = {}
                 for fieldname in records.dtype.names:
                     field_data = records[fieldname]
@@ -293,7 +294,7 @@ class ROOTDump(BulkOutputFormat):
 # Pandas data formats
 ##
 
-class PandasFormat(BulkOutputFormat):
+class PandasFormat(TableFormat):
     pandas_format_key = None
     supports_array_fields = False
 

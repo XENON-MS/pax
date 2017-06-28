@@ -7,22 +7,35 @@ NOTE: This class is stable within major releases.  Do not change any variable
 names of functionality between major releases.  You may add variables in minor
 releases.  Patch releases cannot modify this.
 """
-
-import inspect
-
+from collections import namedtuple
 import numpy as np
+import six
 
-import math
 from pax import units
-
-# DO NOT use Model instead of StrictModel:
-# It improves performance, but kills serialization (numpy int types will apear in class etc)
-# TODO: For Hit class, we may want Model for performance?
-#       Look where the numpy int types get in, force them to python ints.
 from pax.data_model import StrictModel, ListField
+if six.PY3:
+    long = int
 
 
-INT_NAN = -99999  # Do not change without talking to me. -Tunnell 12/3/2015
+INT_NAN = -99999    # Do not change without talking to me. -Tunnell 12/3/2015 ... and me. -Jelle 05/08/2015
+
+
+class ConfidenceTuple(StrictModel):
+    """Confidence tuple
+
+    Stores the information of a confidence level of a reconstructed position
+    """
+    level = float('nan')
+    x0 = float('nan')
+    y0 = float('nan')
+    dx = float('nan')
+    dy = float('nan')
+
+    at_edge = False
+
+    @property
+    def failed(self):
+        return np.isnan(self.x0) or np.isnan(self.y0) or np.isnan(self.dx) or np.isnan(self.dy)
 
 
 class ReconstructedPosition(StrictModel):
@@ -30,128 +43,247 @@ class ReconstructedPosition(StrictModel):
 
     Each reconstruction algorithm creates one of these.
     """
-    x = 0.0  #: x position (cm)
-    y = 0.0  #: y position (cm)
+    x = float('nan')  #: x position (cm)
+    y = float('nan')  #: y position (cm)
 
-    #: goodness-of-fit parameter generated with PosRecChiSquareGamma
-    goodness_of_fit = 0.0
-    # : number of degrees of freedom calculated with PosRecChiSquareGamma
-    ndf = 0.0
+    #: For 3d-position reconstruction algorithms, the z-position (cm)
+    #: This is NOT related to drift time, which is an interaction-level quantity!
+    z = float('nan')
 
-    #: Name of algorithm used for computation
+    #: Goodness-of-fit of hitpattern to position (provided by PosRecTopPatternFit)
+    #: For PosRecThreedPatternFit, the 3d position goodness-of-fit.
+    goodness_of_fit = float('nan')
+
+    #: Number of degrees of freedom used in goodness-of-fit calculation
+    ndf = float('nan')
+
+    #: Name of algorithm which provided this position
     algorithm = 'none'
 
-    # : Errors - currently not used
+    #: Confidence_levels
     # error_matrix = np.array([], dtype=np.float64)
+    confidence_tuples = ListField(ConfidenceTuple)
 
     # For convenience: cylindrical coordinates
     # Must be properties so InterpolatingDetectorMap can transparently use
     # cylindrical coordinates
     @property
     def r(self):
-        return math.sqrt(self.x ** 2 + self.y ** 2)
+        """Radial position"""
+        return np.sqrt(self.x ** 2 + self.y ** 2)
 
+    #: phi position, i.e. angle wrt the x=0 axis in the xy plane (radians)
     @property
     def phi(self):
-        return math.atan2(self.y, self.x)
+        """Angular position (radians, origin at positive x-axis)"""
+        return np.arctan2(self.y, self.x)
 
 
 class Hit(StrictModel):
-    """Peaks found in individual channels
+    """A significant upwards fluctuation in a channel,
+    usually indicative of one or more detected photo-electrons.
+    These are clustered into groups called peaks later.
 
-    These are be clustered into ordinary peaks later. This is commonly
-    called a 'hit' in particle physics detectors.
+    Inside pax this Hit class is rarely used, for performance reasons;
+    instead we build a numpy dtype from this declaration, and use it in arrays of hits.
     """
-    #: Channel in which this peak was found
+    #: Channel in which this hit was found
     channel = 0
 
-    #: Index in the event at which this peak has its maximum.
+    #: Index/sample in the event at which this hit has its maximum.
     index_of_maximum = 0
 
     #: Time (since start of event in ns) of hit's center of gravity
     center = 0.0
 
-    left = 0                 #: Index of left bound (inclusive) of peak.
-    right = 0                #: Index of right bound (INCLUSIVE!!) of peak
+    #: Weighted sum of absolute deviation (in ns) of hit waveform from hit center
+    sum_absolute_deviation = 0.0
+
+    left = 0                 #: Index/sample of left bound (inclusive) of peak.
+    right = 0                #: Index/sample of right bound (INCLUSIVE!!) of peak
 
     @property
     def length(self):
+        """Length of the hit (in samples)"""
         return self.right - self.left + 1
 
-    area = 0.0                  #: Area of the peak in photoelectrons
+    area = 0.0               #: Area of the hit in photoelectrons
 
-    #: Height of highest point in peak (in pe/bin)
+    #: Height of highest point in hit (in pe/sample)
     height = 0.0
 
-    #: Noise sigma in pe/bin of pulse in which peak was found.
-    #: Note: in Pulse the same number is stored in ADC-counts
+    #: Noise sigma in pe/sample of the pulse in which the hit was found.
+    #: Note: in Pulse the same number is stored in ADC-counts.
     noise_sigma = 0.0
 
-    #: Index of pulse (in event.pulses) in which peak was found
+    #: Index of pulse (in event.pulses) in which hit was found
     found_in_pulse = 0
 
-    #: Set to True if rejected by suspicious channel algorithm
+    #: Set to True if rejected by suspicious channel algorithm.
+    #: This means the hit should be disregarded by clustering algorithms.
     is_rejected = False
+
+    #: Number of samples in this hit where the ADC saturates
+    n_saturated = 0
+
+
+class TriggerSignal(StrictModel):
+    """A simplified peak class which is produced by the trigger
+    Like Hit, this class not actually used. So default here are meaningless (except for type spec),
+    np.zeros just sets all to zero.
+
+    All times below are in ns since the start of the run only while we are in the trigger,
+    but in ns since the start of the event as soon as the event is built. The conversion is done in
+    MongoDB.ReadUntriggeredFiller.
+    """
+
+    #: "Type" of the signal. 1 for S1 candidates, 2 for S2 candidates
+    type = 0
+
+    #: Did this signal cause a trigger?
+    trigger = False
+
+    #: Time at which the signal starts.
+    left_time = 0
+
+    #: Time at which the signal ends
+    right_time = 0
+
+    #: Number of pulses contributing to this signal
+    n_pulses = 0
+
+    #: Number of channels contributing at least 1 pulse to this signal
+    n_contributing_channels = 0
+
+    #: Mean pulse time start time
+    time_mean = 0.0
+
+    #: Root mean square deviation of pulse start times
+    time_rms = float('nan')
+
+    #: Total area in the signal (gain-weighted sum of integrals found by Kodiaq pulse integration)
+    area = float('nan')
+
+    # x = float('nan')
+    # y = float('nan')
 
 
 class Peak(StrictModel):
-    """Peak
-
-    A peak will be, e.g., S1 or S2.
+    """A group of nearby hits across one or more channels.
+    Peaks will be classified as e.g. s1, s2, lone_hit, unknown, coincidence
     """
+    #: Type of peak (e.g., 's1', 's2', ...):
+    #: NB 'lone_hit' incicates one or more hits in a single channel. Use lone_hit_channel to retrieve that channel.
+    type = 'unknown'
+
+    #: Detector in which the peak was found, e.g. tpc or veto
+    detector = 'none'
 
     ##
-    # Basics
+    #  Hit, area, and saturation data
     ##
 
-    type = 'unknown'        #: Type of peak (e.g., 's1', 's2', ...)
-    detector = 'none'       #: e.g. tpc or veto
+    #: The hits that make up this peak
+    #: To save space, we usually only store the hits for s1s.
+    hits = np.array([], dtype=Hit.get_dtype())
 
-    #: Area of the pulse in photoelectrons. Includes only contributing pmts in the right detector.
-    #: For XDP matching rightmost sample is not included in area integral.
-    area = 0.0
-
-    ##
-    #  Low-level data
-    ##
-
-    #: Peaks in individual channels that make up this peak
-    hits = ListField(Hit)
-
-    #: Array of areas in each PMT.
+    #: Total areas of all hits per PMT (pe).
     area_per_channel = np.array([], dtype='float64')
 
-    #: Does a channel have no hits, but digitizer shows data?
-    does_channel_have_noise = np.array([], dtype=np.bool)
+    #: Total area of all hits across all PMTs (pes).
+    #: In XerawdpImitation mode, rightmost sample is not included in area integral.
+    area = 0.0
 
-    #: Does a PMT see 'something significant'? (thresholds configurable)
-    does_channel_contribute = np.array([], dtype=np.bool)
+    #: Fraction of area in the top PMTs
+    area_fraction_top = 0.0
+
+    #: Multiplicative correction on S2 due to LCE variations
+    s2_spatial_correction = 1.0
+
+    #: Multiplicative correction on S2 due to saturation
+    s2_saturation_correction = 1.0
+
+    #: Number of hits in the peak, per channel (that is, it's an array with index = channel number)
+    hits_per_channel = np.array([], dtype=np.int16)
+
+    #: Number of channels which contribute to the peak
+    n_contributing_channels = 0
+
+    #: Number of channels in the top array contributing to the peak
+    n_contributing_channels_top = 0
+
+    #: Total number of hits in the peak
+    n_hits = 0
+
+    #: Fraction of hits in the top array
+    hits_fraction_top = 0.0
+
+    #: Number of samples with ADC saturation in this peak, per channel
+    n_saturated_per_channel = np.array([], dtype=np.int16)
+
+    @property
+    def is_channel_saturated(self):
+        """Boolean array of n_channels which indicates if there was ADC saturation in any hit
+        in that channel during the peak"""
+        return self.n_saturated_per_channel > 0
+
+    @property
+    def saturated_channels(self):
+        """List of channels which contribute hits with saturated channels in this peak"""
+        return np.where(self.n_saturated_per_channel > 0)[0]
+
+    #: Total number of samples with ADC saturation threshold in all channels in this peak
+    n_saturated_samples = 0
+
+    #: Total number of channels in the peakw hich have at least one saturated hit
+    n_saturated_channels = 0
+
+    #: If the peak is a lone_hit: the channel the hit is / hits are in
+    lone_hit_channel = INT_NAN
+
+    @property
+    def does_channel_contribute(self):
+        """Boolean array of n_channels which tells you if the channel contributes any hit"""
+        return self.area_per_channel > 0
 
     @property
     def contributing_channels(self):
+        """List of channels which contribute one or more hits to this peak"""
         return np.where(self.does_channel_contribute)[0]
-
-    @property
-    def noise_channels(self):
-        return np.where(self.does_channel_have_noise)[0]
 
     ##
     # Time distribution information
     ##
 
-    left = 0                 #: Index of left bound (inclusive) in event.
-    right = 0                #: Index of right bound (INCLUSIVE) in event.
+    left = 0                 #: Index/sample of left bound (inclusive) in event.
+    right = 0                #: Index/sample of right bound (INCLUSIVE) in event.
 
-    #: Weighted (by hit area) mean of hit times (since event start)
+    #: Weighted (by hit area) mean of hit times (since event start) [ns]
     hit_time_mean = 0.0
 
-    #: Weighted (by hit area) std of hit times
+    #: Weighted (by hit area) std of hit times [ns]
     hit_time_std = 0.0
 
-    #: Time range of centermost hits containing at least 50% / 90% of area (with center at hit_time_mean)
-    #: (rightmostright - leftmostleft + 1) * sample_duration
-    range_50p_area = 0.0
-    range_90p_area = 0.0
+    #: Central range of peak (hit-only) sum waveform which includes a given decile (0-10) of area [ns].
+    #: e.g. range_area_decile[5] = range of 50% area = distance (in time) between point
+    #: of 25% area and 75% area (with boundary samples added fractionally).
+    #: First element (0) is always zero, last element (10) is the full range of the peak.
+    range_area_decile = np.zeros(11, dtype=np.float)
+
+    @property
+    def range_50p_area(self):
+        return self.range_area_decile[5]
+
+    @property
+    def range_90p_area(self):
+        return self.range_area_decile[9]
+
+    @property
+    def full_range(self):
+        return self.range_area_decile[10]
+
+    #: Time at which the peak reaches 50% of its area (with the central sample considered fractionally)
+    area_midpoint = 0.0
 
     ##
     # Spatial pattern information
@@ -160,38 +292,76 @@ class Peak(StrictModel):
     #: List of reconstructed positions (instances of :class:`pax.datastructure.ReconstructedPosition`)
     reconstructed_positions = ListField(ReconstructedPosition)
 
-    #: Weighted root mean square deviation of top hitpattern (cm)
-    top_hitpattern_spread = 0.0
+    def get_reconstructed_position_from_algorithm(self, algorithm):
+        """Return reconstructed position found by algorithm, or None if the peak doesn't have one"""
+        for rp in self.reconstructed_positions:
+            if rp.algorithm == algorithm:
+                return rp
+        return None
 
-    #: Weighted root mean square deviation of bottom hitpattern (cm)
-    bottom_hitpattern_spread = 0.0
+    def get_position_from_preferred_algorithm(self, algorithm_list):
+        """Return reconstructed position by the first algorithm in list,
+        unless it doesn't exist or is a nan position, then moves on to further algorithms."""
+        for algo in algorithm_list:
+            rp = self.get_reconstructed_position_from_algorithm(algo)
+            if rp is not None and not np.isnan(rp.x):
+                return rp
+        else:
+            raise ValueError("Could not find any position from the chosen algorithms: %s" % algorithm_list)
 
-    #: Fraction of area in the top array
-    area_fraction_top = 0.0
+    #: Weighted-average distance of top array hits from weighted mean hitpattern center on top array (cm)
+    top_hitpattern_spread = float('nan')
+
+    #: Weighted-average distance of bottom array hits from weighted mean hitpattern center on bottom array (cm)
+    bottom_hitpattern_spread = float('nan')
 
     ##
     # Signal / noise info
     ##
 
-    #: Number of PMTS which see something significant (depends on settings) ~~ "coincidence level"
-    n_contributing_channels = 0
-
-    #: Number of channels that show no hits, but digitizer shows data
-    n_noise_channels = 0
-
     #: Weighted (by area) mean hit amplitude / noise level in that hit's channel
     mean_amplitude_to_noise = 0.0
 
+    #: Number of pulses without hits in the event overlapping (in time; at least partially) with this peak.
+    #: Includes channels from other detectors (since veto and tpc cables could influence each other)
+    n_noise_pulses = 0
+
     ##
-    # Deprecated sum-waveform stuff, needed for Xerawdp matching??
+    # Sum-waveform properties
     ##
 
-    #: Index in the event's sum waveform at which this peak has its maximum.
+    #: Cut-out of the peak's sum waveform in pe/bin
+    #: The peak's center of gravity is always in the center of the array.
+    sum_waveform = np.array([], dtype=np.float32)
+
+    #: For tpc peaks, the peak's sum waveform in the top array only. Aligned with the sum waveform.
+    sum_waveform_top = np.array([], dtype=np.float32)
+
+    #: Index/sample in the event's sum waveform at which this peak has its maximum.
     index_of_maximum = 0
 
-    #: Height of highest point in peak (in pe/bin)
-    #: In new pax, is height of highest hit
+    #: Time since start of the event at which the peak's sum waveform has its center of gravity [ns].
+    center_time = 0.0
+
+    #: Height of sum waveform (in pe/bin)
     height = 0.0
+
+    ##
+    # Clustering record
+    ##
+
+    #: Best goodness of split observed inside the peak
+    interior_split_goodness = float('nan')
+
+    #: Area fraction of the smallest of the two halves considered in the best split inside the peak
+    #: (i.e. the one corresponding to interior_split_goodness)
+    interior_split_fraction = float('nan')
+
+    #: Goodness of split of last split that was used to construct this peak (if split did occur).
+    birthing_split_goodness = float('nan')
+
+    #: Area of this peak / area of parent peak it was split from (if split did occur)
+    birthing_split_fraction = float('nan')
 
 
 class SumWaveform(StrictModel):
@@ -209,7 +379,7 @@ class SumWaveform(StrictModel):
     channel_list = np.array([], dtype=np.uint16)
 
     #: Array of samples, units of pe/bin.
-    samples = np.array([], dtype=np.float64)
+    samples = np.array([], dtype=np.float32)
 
     def is_filtered(self):
         if self.name_of_filter != 'none':
@@ -219,40 +389,43 @@ class SumWaveform(StrictModel):
 
 
 class Pulse(StrictModel):
-    """A DAQ pulse
+    """A region of raw digitizer data.
+    For DAQs with zero-length encoding or self-triggering, there will be several of these per channel per event.
 
-    A DAQ pulse can also be thought of as a pulse in a PMT.
+    Remember that PMT signals show as downward fluctuations in raw digitizer data.
+    In processed data output, only pulses contributing hits to S1s are stored (except in LED mode), and the
+    raw_data field is never stored.
     """
 
-    #: Start time of this pulse: samples
-    #:
-    #: Units are samples. This nonnegative number starts at zero and is an integer because
-    #: it's an index.
+    #: Start index/sample of this pulse (inclusive)
+    #: This refers to a hypothetical array containing the event waveform information.
+    #: For example, 0 is the first sample that could exist in the event, 1 the second, etc.
     left = INT_NAN
 
-    #: Stoptime of this pulse within event
-    #:
-    #: Units are samples and this time is inclusive of last sample.  This nonnegative number
-    #: starts at zero and is an integer because it's an index.
+    #: Stop index/sample of this pulse (INCLUSIVE!)
     right = INT_NAN
 
     #: Channel number the pulse belongs to
     channel = INT_NAN
 
-    #: Raw wave data (numpy array of int16, ADC counts)
+    #: Raw wave data (numpy array of int16, raw ADC counts)
     raw_data = np.array([], np.int16)
 
     #: Baseline in ADC counts relative to reference baseline -- but float!
+    #: This field is omitted in processed data (to save space)
     baseline = float('nan')
 
-    #: Maximum amplitude reached in the pulse (in ADC counts above baseline)
+    #: Maximum amplitude reached in the pulse (in ADC counts above pulse baseline)
     maximum = float('nan')
 
-    #: Minimum amplitude (in ADC counts above baseline, so should be negative)
+    #: Minimum amplitude (in ADC counts above pulse baseline, so should be negative)
     minimum = float('nan')
 
     #: Noise sigma for this pulse (in ADC counts - but float!)
     noise_sigma = float('nan')
+
+    #: Number of hits found in this pulse
+    n_hits_found = 0
 
     @property
     def length(self):
@@ -266,7 +439,7 @@ class Pulse(StrictModel):
          - raw_data (numpy array of samples)
          - right (last index)
         """
-        super().__init__(**kwargs)
+        StrictModel.__init__(self, **kwargs)
 
         if self.channel == INT_NAN:
             raise ValueError("Must specify channel to init Pulse")
@@ -279,70 +452,173 @@ class Pulse(StrictModel):
             self.right = self.left + len(self.raw_data) - 1
 
 
-class Event(StrictModel):
-    """Event class
-
-    Stores high level information about the triggered event.
+class Interaction(StrictModel):
+    """An interaction in the TPC, reconstructed from a pair of S1 and S2 peaks.
     """
-    dataset_name = 'Unknown'  # The name of the dataset this event belongs to
+    #: Index (in event.peaks) of the s1 peak of this interaction
+    s1 = INT_NAN
 
-    # A nonnegative integer that uniquely identifies the event within the
-    # dataset.
+    #: Index (in event.peaks) of the s2 peak of this interaction
+    s2 = INT_NAN
+
+    ##
+    # Position information
+    ##
+
+    #: The reconstructed position of the interaction
+    x = float('nan')  #: x position of the interaction (cm)
+    y = float('nan')  #: y position of the interaction (cm)
+
+    #: goodness-of-fit parameter of s2 hitpattern to x,y position reconstructed by PosRecTopPatternFit
+    xy_posrec_goodness_of_fit = float('nan')
+
+    #: number of degrees of freedom calculated with PosRecTopPatternFit
+    xy_posrec_ndf = float('nan')
+
+    #: Algorithm used to reconstruct xy position
+    xy_posrec_algorithm = 'none'
+
+    #: Drift time (ns) between s1 and s2
+    drift_time = float('nan')
+
+    #: z position (cm) calculated from drift time.
+    #: This is simply - drift time * drift velocity
+    z = float('nan')
+
+    #: r position (cm)
+    @property
+    def r(self):
+        return np.sqrt(self.x ** 2 + self.y ** 2)
+
+    #: phi position, i.e. angle wrt the x=0 axis in the xy plane (radians)
+    @property
+    def phi(self):
+        return np.arctan2(self.y, self.x)
+
+    def set_position(self, recpos):
+        """Sets the x, y position of the interaction
+        based on a :class:`pax.datastructure.ReconstructedPosition` object"""
+        self.x = recpos.x
+        self.y = recpos.y
+        self.xy_posrec_algorithm = recpos.algorithm
+        self.xy_posrec_ndf = recpos.ndf
+        self.xy_posrec_goodness_of_fit = recpos.goodness_of_fit
+
+    ##
+    # Interaction properties
+    ##
+
+    #: Multiplicative correction on S1 due to LCE variations
+    s1_spatial_correction = 1.0
+
+    #: Multiplicative correction on S1 due to saturation
+    s1_saturation_correction = 1.0
+
+    #: Multiplicative correction on S2 due to electron lifetime
+    s2_lifetime_correction = 1.0
+
+    #: Final multiplicative correction to s1 area based on position (due to LCE variations and saturation)
+    s1_area_correction = 1.0
+
+    @property
+    def corrected_s1_area(self):
+        return self.s1.area * self.s1_area_correction
+
+    #: Final multiplicative correction to s2 area based on position
+    # (due to electron lifetime, LCE variations and saturation)
+    s2_area_correction = 1.0
+
+    @property
+    def corrected_s2_area(self):
+        return self.s2.area * self.s2_area_correction
+
+    #: log10(corrected S2 area / corrected S1 area). Used for recoil type discrimination.
+    @property
+    def log_cs2_cs1(self):
+        return np.log10(self.corrected_s2_area / self.corrected_s1_area)
+
+    ##
+    # Likelihoods
+    ##
+
+    #: Goodness of fit of S1 pattern to interaction's (x, y, drift_time)
+    s1_pattern_fit = float('nan')
+
+
+class Event(StrictModel):
+    """Object holding high-level information about a triggered event,
+    and list of objects (such as Peak, Hit and Pulse) containing lower-level information.
+    """
+    #: The name of the dataset this event belongs to
+    dataset_name = 'Unknown'
+
+    #: A nonnegative integer that uniquely identifies the event within the dataset.
     event_number = 0
 
-    #: Number of channels in the event
-    #: Has to be the same as n_channels in config, provided here for deserialization ease
+    #: Total number of channels in the event (whether or not they see anything).
+    #: Has to be the same as n_channels in config, provided here for deserialization ease.
     n_channels = INT_NAN
 
-    #: Integer start time of the event in nanoseconds
-    #:
-    #: Time that the first sample starts. This is a 64-bit number that follows the
-    #: UNIX clock. Or rather, it starts from January 1, 1970.  This must be an integer
-    #: because floats have rounding that result in imprecise times.  You could
-    #: think of this as the time of the earliest sample.
-    start_time = 0
+    #: Integer start time of the event in nanoseconds since January 1, 1970.
+    #: This is the time that the first sample starts.
+    #: NB: don't do floating-point arithmetic on 64-bit integers such as these,
+    #: floats have rounding that result in loss of precision.
+    start_time = long(0)
 
-    #: Integer stop time of the event in nanoseconds
-    #
-    #: This stop time includes the last recorded sample.  Therefore, it's the right
-    #: edge of the last sample.  This is a 64-bit integer for the reasons explained
-    #: in 'start_time'.
-    stop_time = 0
+    #: Integer stop time of the event in nanoseconds since January 1, 1970.
+    #: This is the time that the last sample ends.
+    #: NB: don't do floating-point arithmetic on 64-bit integers such as these,
+    #: floats have rounding that result in loss of precision.
+    stop_time = long(0)
 
-    #: Time duration of a sample (in pax units, i.e. ns)
-    #: For V1724 digitizers (e.g. XENON), this is 10 nanoseconds always.
+    #: Time duration of a sample (in ns).
+    #: For V1724 digitizers (e.g. XENON), this is 10 nanoseconds.
     #: This is also in config, but we need it here too, to convert between event duration and length in samples
     #: Must be an int for same reason as start_time and stop_time
     #: DO NOT set to 10 ns as default, otherwise no way to check if it was given to constructor!
     sample_duration = 0
 
-    #: List of peaks
-    #:
-    #: Returns a list of :class:`pax.datastructure.Peak` classes.
+    #: A list of :class:`pax.datastructure.Interaction` objects.
+    interactions = ListField(Interaction)
+
+    #: A list of :class:`pax.datastructure.Peak` objects.
     peaks = ListField(Peak)
 
-    #: Temporary list of hits -- will be shipped off to peaks later
-    all_hits = ListField(Hit)
+    #: Array of trigger signals contained in the event
+    trigger_signals = np.array([], dtype=TriggerSignal.get_dtype())
 
-    #: Returns a list of sum waveforms
-    #:
-    #: Returns an :class:`pax.datastructure.SumWaveform` class.
+    #: Array of all hits found in event
+    #: These will get grouped into peaks during clustering
+    #: This is usually emptied before output (but not in LED mode)
+    all_hits = np.array([], dtype=Hit.get_dtype())
+
+    #: A list :class:`pax.datastructure.SumWaveform` objects.
     sum_waveforms = ListField(SumWaveform)
 
-    #: A python list of all pulses in the event (containing instances of the Pulse class)
-    #: An pulse holds a stream of samples in one channel, as provided by the digitizer.
+    #: A list of :class:`pax.datastructure.Interaction` objects.
+    #: An pulse holds a stream of samples in one channel provided by the digitizer.
+    #: To save space, only the pulses contributing hits to S1s are kept in the output (but not in LED mode)
     pulses = ListField(Pulse)
 
     #: Number of noise pulses (pulses without any hits found) per channel
-    noise_pulses_in = np.array([], dtype=np.int)
+    noise_pulses_in = np.array([], dtype=np.int16)
+
+    #: Number of lone hits per channel BEFORE suspicious channel hit rejection.
+    #: lone_hit is a peak type (sorry, confusing...) indicating just one contributing channel.
+    #: Use this to check / calibrate the suspicious channel hit rejection.
+    lone_hits_per_channel_before = np.array([], dtype=np.int16)
+
+    #: Number of lone hits per channel AFTER suspicious channel hit rejection.
+    #: lone_hit is a peak type (sorry, confusing...) indicating just one contributing channel
+    lone_hits_per_channel = np.array([], dtype=np.int16)
 
     #: Was channel flagged as suspicious?
     is_channel_suspicious = np.array([], dtype=np.bool)
 
-    #: Number of hits rejected in the suspicious channel algorithm
-    n_hits_rejected = np.array([], dtype=np.int)
+    #: Number of hits rejected per channel in the suspicious channel algorithm
+    n_hits_rejected = np.array([], dtype=np.int16)
 
-    def __init__(self, n_channels, start_time, partial=False, **kwargs):
+    def __init__(self, n_channels, start_time, **kwargs):
 
         # Start time is mandatory, so it is not in kwargs
         kwargs['start_time'] = start_time
@@ -351,7 +627,7 @@ class Event(StrictModel):
         # Model's init must be called first, else we can't store attributes
         # This will store all of the kwargs as attrs
         # We don't pass length, it's not an attribute that can be set
-        super().__init__(**{k: v for k, v in kwargs.items() if k != 'length'})
+        StrictModel.__init__(self, **{k: v for k, v in kwargs.items() if k != 'length'})
 
         # Cheat to init stop_time from length and duration
         if 'length' in kwargs and self.sample_duration and not self.stop_time:
@@ -362,12 +638,14 @@ class Event(StrictModel):
                              "pass sample_duration and either stop_time or length")
 
         if self.duration() <= 0:
-            raise ValueError("Negative event duration")
+            raise ValueError("Nonpositive event duration %s!" % self.duration())
 
         # Initialize numpy arrays -- need to have n_channels and self.length
-        self.noise_pulses_in = np.zeros(n_channels, dtype=np.int)
-        self.n_hits_rejected = np.zeros(n_channels, dtype=np.int)
+        self.noise_pulses_in = np.zeros(n_channels, dtype=np.int16)
+        self.n_hits_rejected = np.zeros(n_channels, dtype=np.int16)
         self.is_channel_suspicious = np.zeros(n_channels, dtype=np.bool)
+        self.lone_hits_per_channel_before = np.zeros(n_channels, dtype=np.int16)
+        self.lone_hits_per_channel = np.zeros(n_channels, dtype=np.int16)
 
     @classmethod
     def empty_event(cls):
@@ -401,29 +679,61 @@ class Event(StrictModel):
         """
         return int(self.duration() / self.sample_duration)
 
-    def S1s(self, detector='tpc', sort_key='area', reverse=True):  # noqa
+    def s1s(self, detector='tpc', sort_key='area', reverse=True):  # noqa
         """List of S1 (scintillation) signals in this event
-
-        Returns a list of :class:`pax.datastructure.Peak` objects
+        In the ROOT class output, this returns a list of integer indices in event.peaks
+        Inside pax, returns a list of :class:`pax.datastructure.Peak` objects
           whose type is 's1', and
           who are in the detector specified by the 'detector' argument (unless detector='all')
         The returned list is sorted DESCENDING (i.e. reversed!) by the key sort_key (default area)
         unless you pass reverse=False, then it is ascending.
         """
-        return self._get_peaks_by_type('s1', sort_key, reverse, detector)
+        return self.get_peaks_by_type('s1', sort_key=sort_key, reverse=reverse, detector=detector)
 
-    def S2s(self, detector='tpc', sort_key='area', reverse=True):  # noqa
+    def S1s(self, *args, **kwargs):
+        """See s1s"""
+        return self.s1s(*args, **kwargs)
+
+    def s2s(self, detector='tpc', sort_key='area', reverse=True):  # noqa
         """List of S2 (ionization) signals in this event
-
-        Returns a list of :class:`pax.datastructure.Peak` objects
+        In the ROOT class output, this returns a list of integer indices in event.peaks.
+        Inside pax, returns a list of :class:`pax.datastructure.Peak` objects
           whose type is 's2', and
           who are in the detector specified by the 'detector' argument (unless detector='all')
         The returned list is sorted DESCENDING (i.e. reversed!) by the key sort_key (default area)
         unless you pass reverse=False, then it is ascending.
         """
-        return self._get_peaks_by_type('s2', sort_key, reverse, detector)
+        return self.get_peaks_by_type(desired_type='s2', sort_key=sort_key, reverse=reverse, detector=detector)
 
-    def _get_peaks_by_type(self, desired_type, sort_key, reverse=True, detector='tpc'):
+    def S2s(self, *args, **kwargs):
+        """See s2s"""
+        return self.s2s(*args, **kwargs)
+
+    @property
+    def main_s1(self):
+        """Return the S1 of the primary interaction, or if that does not exist, the largest S1 in the tpc.
+        Returns None if neither exist"""
+        if self.interactions:
+            return self.peaks[self.interactions[0].s1]
+        else:
+            try:
+                return self.s1s()[0]
+            except IndexError:
+                return None
+
+    @property
+    def main_s2(self):
+        """Return the S2 of the primary interaction, or if that does not exist, the largest S2 in the tpc.
+        Returns None if neither exist"""
+        if self.interactions:
+            return self.peaks[self.interactions[0].s2]
+        else:
+            try:
+                return self.s2s()[0]
+            except IndexError:
+                return None
+
+    def get_peaks_by_type(self, desired_type='all', detector='tpc', sort_key='area', reverse=True):
         """Helper function for retrieving only certain types of peaks
         Returns a list of :class:`pax.datastructure.Peak` objects
           whose type is desired_type, and
@@ -434,10 +744,10 @@ class Event(StrictModel):
         # Extract only peaks of a certain type
         peaks = []
         for peak in self.peaks:
-            if peak.detector is not 'all':
+            if detector != 'all':
                 if peak.detector != detector:
                     continue
-            if peak.type.lower() != desired_type:
+            if desired_type != 'all' and peak.type.lower() != desired_type:
                 continue
             peaks.append(peak)
 
@@ -449,16 +759,10 @@ class Event(StrictModel):
         return peaks
 
 
-def _explain(class_name):
-    x = inspect.getmembers(class_name,
-                           predicate=inspect.isdatadescriptor)
-
-    for a, b in x:
-        if a.startswith('_'):
-            continue
-        print(a, b.__doc__)
-
-
-if __name__ == '__main__':
-    _explain(Peak)
-    _explain(Event)
+# An event proxy object which can hold arbitrary data
+# but still has an event_number attribute
+# The decoders for and WriteZipped & Readzipped knows what to do with this,
+# other code will be fooled into treating it as a normal event
+# (except the explicit event class checks in ProcessPlugin of course,
+#  these have to be disabled by as needed using do_output_check and do_input_check)
+EventProxy = namedtuple('EventProxy', ['data', 'event_number'])

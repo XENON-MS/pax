@@ -11,6 +11,7 @@ Tests for `pax` module.
 import unittest
 import inspect
 import tempfile
+import shutil
 import os
 
 from pax import core, plugin, datastructure
@@ -76,6 +77,7 @@ class TestPax(unittest.TestCase):
 
     def test_dummy_output_plugin(self):
         mypax = core.Processor(config_dict={'pax': {'plugin_group_names':   ['output'],
+                                                    'encoder_plugin': None,
                                                     'output':                'Dummy.DummyOutput'}},
                                just_testing=True)
         self.assertIsInstance(mypax, core.Processor)
@@ -107,32 +109,26 @@ class TestPax(unittest.TestCase):
         self.assertIsInstance(pl, plugin.InputPlugin)
         self.assertEqual(pl.__class__.__name__, 'DummyInput')
 
-    def test_evaluate_default_configuration(self):
-        """ Test loading the entire default configuration & all its plugins
-        Will trigger a warning: no configuration specified
+    def test_no_configuration(self):
+        """ Test RuntimeError when no configuration
         """
-        mypax = core.Processor()
-        self.assertIsInstance(mypax, core.Processor)
-        self.assertIsInstance(mypax.input_plugin,  plugin.InputPlugin)
-        self.assertTrue(len(mypax.action_plugins) > 0)
-        for p in mypax.action_plugins:
-            self.assertIsInstance(p, (plugin.TransformPlugin, plugin.OutputPlugin))
-            p.shutdown()    # To close output file we just wrote, normally happens after .run()
+        with self.assertRaises(RuntimeError):
+            core.Processor()
 
     def test_custom_plugin_location(self):
         """Tests loading a plugin from a custom location"""
-        tempdir = tempfile.TemporaryDirectory()
-        with open(os.path.join(tempdir.name, 'temp_plugin_file.py'), mode='w') as outfile:
+        tempdir = tempfile.mkdtemp()
+        with open(os.path.join(tempdir, 'temp_plugin_file.py'), mode='w') as outfile:
             outfile.write(dummy_plugin)
         mypax = core.Processor(config_dict={'pax': {'plugin_group_names':   ['bla'],
-                                                    'plugin_paths':         [tempdir.name],
+                                                    'plugin_paths':         [tempdir],
                                                     'bla':                  'temp_plugin_file.FunkyTransform'}},
                                just_testing=True)
         self.assertIsInstance(mypax, core.Processor)
         pl = mypax.get_plugin_by_name('FunkyTransform')
         self.assertIsInstance(pl, plugin.TransformPlugin)
         self.assertTrue(hasattr(pl, 'gnork'))
-        tempdir.cleanup()
+        shutil.rmtree(tempdir)
 
     ##
     # Test event processing
@@ -163,17 +159,19 @@ class TestPax(unittest.TestCase):
     def test_process_single_xed_event(self):
         """ Process the first event from the XED file.
         """
-        # TODO: delete the HD5 file that is created by this
-        mypax = core.Processor(config_names='XED', config_dict={'pax': {'events_to_process': [0]}})
+        config = {'pax': {'events_to_process': [0],
+                          'encoder_plugin': None,
+                          'output': 'Dummy.DummyOutput'}}
+        mypax = core.Processor(config_names='XENON100', config_dict=config)
         mypax.run()
 
     def test_process_single_xed_event_olddsp(self):
         """ Process the first event from the XED file using Xerawdp matching config
         """
-        # TODO: delete the HD5 file that is created by this
-        mypax = core.Processor(config_names=['XED', 'XerawdpImitation'],
+        mypax = core.Processor(config_names=['XENON100', 'XerawdpImitation'],
                                config_dict={'pax': {
                                    'events_to_process': [0],
+                                   'encoder_plugin': None,
                                    'output': 'Dummy.DummyOutput'}})
         mypax.run()
         pl = mypax.get_plugin_by_name('DummyOutput')
@@ -187,6 +185,76 @@ class TestPax(unittest.TestCase):
                           430.28177885354137, 1.9494012301013646, 1.52583418095758,
                           1.5248293965443862, 1.5214431653719354, 1.1431245035453605,
                           1.119126521198631, 0.8370846398458212, 0.3965132112382404])
+
+    def test_process_event_list(self):
+        """ Take a list of event numbers from a file
+        """
+        with open('temp_eventlist.txt', mode='w') as outfile:
+            outfile.write("0\n7\n")
+        config = {'pax': {'event_numbers_file': 'temp_eventlist.txt',
+                          'plugin_group_names': ['input', 'output'],
+                          'encoder_plugin': None,
+                          'output': 'Dummy.DummyOutput'}}
+        mypax = core.Processor(config_names='XENON100', config_dict=config)
+        mypax.run()
+        self.assertEqual(mypax.get_plugin_by_name('DummyOutput').last_event.event_number, 7)
+        os.remove('temp_eventlist.txt')
+
+    def test_process_event_list_multiprocessing(self):
+        """Take a list of event numbers from a file, and process them on two cores
+        """
+        with open('temp_eventlist.txt', mode='w') as outfile:
+            outfile.write("0\n7\n")
+        config = {'pax': {'event_numbers_file': 'temp_eventlist.txt',
+                          'plugin_group_names': ['input', 'output'],
+                          'n_cpus': 2,
+                          'output_name': 'test_output',
+                          'encoder_plugin': None,
+                          'output': 'Table.TableWriter'},
+                  'Table.TableWriter': {'output_format': 'csv'}}
+        mypax = core.Processor(config_names='XENON100', config_dict=config)
+        mypax.run()
+        del mypax
+
+        # Check we actually wrote two events (and a header row)
+        self.assertTrue(os.path.exists('test_output'))
+        self.assertTrue(os.path.exists('test_output/Event.csv'))
+        with open('test_output/Event.csv') as infile:
+            self.assertEqual(len(infile.readlines()), 3)
+
+        # Cleanup
+        shutil.rmtree('test_output')
+        os.remove('temp_eventlist.txt')
+
+    def test_simulator(self):
+        """ Process the events in dummy_waveforms.csv
+        """
+        mypax = core.Processor(config_names=['XENON100', 'Simulation'],
+                               config_dict={'pax': {
+                                   'encoder_plugin': None,
+                                   'output': 'Dummy.DummyOutput'}})
+        mypax.run()
+        pl = mypax.get_plugin_by_name('DummyOutput')
+        self.assertIsInstance(pl, plugin.OutputPlugin)
+        # TODO: do some checks on the simulator output
+
+    def test_plotting(self):
+        """ Plot the first event from the default XED file
+        """
+        import matplotlib
+        # Force matplotlib to switch to a non-GUI backend, so the test runs on Travis
+        matplotlib.pyplot.switch_backend('Agg')
+        mypax = core.Processor(config_names='XENON100',
+                               config_dict={'pax': {'output': 'Plotting.PlotEventSummary',
+                                                    'pre_output': [],
+                                                    'encoder_plugin': None,
+                                                    'events_to_process': [0],
+                                                    'output_name': 'plots_test'}})
+        mypax.run()
+        self.assertTrue(os.path.exists('./plots_test'))
+        self.assertTrue(os.path.exists('./plots_test/000000.png'))
+        shutil.rmtree('plots_test')
+
 
 if __name__ == '__main__':
     unittest.main()
