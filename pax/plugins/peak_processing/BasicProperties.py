@@ -34,7 +34,11 @@ class BasicProperties(plugin.TransformPlugin):
 
             with np.errstate(divide='ignore', invalid='ignore'):
 				peak.mean_amplitude_to_noise = np.average(hits['height']/hits['noise_sigma'], weights=hits['area'])
+<<<<<<< HEAD
 
+=======
+                
+>>>>>>> 72f1380f1b21d62d55c29939705c10f8241db686
             peak.area = np.sum(peak.area_per_channel)
             peak.n_hits = np.sum(peak.hits_per_channel)
             peak.n_saturated_samples = np.sum(peak.n_saturated_per_channel)
