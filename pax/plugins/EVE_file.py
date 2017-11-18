@@ -253,11 +253,10 @@ class EveInput(InputFromFolder):
         # Read event event header, check if it is a real data event or file event header or something different.
         event_event_header = np.fromfile(self.current_evefile, dtype=eve_event_header, count=1)[0]
 
-        """ commented these lines  as they never happened !!!
         if event_event_header['event_type'] not in [3, 4]:  # 3 = signal event, 4 = header event. Do others occur?
             raise NotImplementedError("Event type %i not yet implemented!"
                                       % event_event_header['event_type'], self.current_evefile.tell())
-
+        """
         if event_event_header['event_type'] == 4:
             # it might be possible to get another event header along with caen1724.par stuff
             self.log.error("Unexpected event header at this position, trying to go on")
@@ -337,18 +336,18 @@ class EveInput(InputFromFolder):
                             ))
                             sample_position += 2 * (cword & 512)  # 1048575 == 2**20 -1
 
-        # TODO: Check we have read all data for this event
-        # affe = hex(np.fromfile(self.current_evefile, dtype=np.uint32, count=1)[0])
-        # self.current_evefile.seek(4, 1)
-        """
+        affe = hex(np.fromfile(self.current_evefile, dtype=np.uint32, count=1)[0])
+        self.current_evefile.seek(4, 1)
+        
         if affe != '0xaffe':
             print("WARNING : EVENT DID NOT END WITH 0XAFFE!! INSTEAD IT ENDED WITH ", affe)
+        
         if event_position != len(self.event_positions) - 1:
-            current_pos = self.current_evefile.tell()
+            current_pos = self.current_evefile.tell() - 4
             should_be_at_pos = self.event_positions[event_position + 1]
             if current_pos != should_be_at_pos:
-                raise RuntimeError("Error during XED reading: after reading event %d from file "
+                raise RuntimeError("Error during EVE reading: after reading event %d from file "
                                    "(event number %d) we should be at position %d, but we are at position %d!" % (
                                        event_position, event.event_number, should_be_at_pos, current_pos))
-        """
+        
         return event

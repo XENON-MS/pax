@@ -68,3 +68,4 @@ analysis/analysis_results
 # Numba caches
 *.nbc
 *.nbi
+*.py~

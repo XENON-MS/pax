@@ -26,6 +26,20 @@ else:
     import importlib
 import heapq
 
+import signal
+
+class timeout:
+    def __init__(self, seconds=1, error_message='Timeout'):
+        self.seconds = seconds
+        self.error_message = error_message
+    def handle_timeout(self, signum, frame):
+        raise TimeoutError(self.error_message)
+    def __enter__(self):
+        signal.signal(signal.SIGALRM, self.handle_timeout)
+        signal.alarm(self.seconds)
+    def __exit__(self, type, value, traceback):
+        signal.alarm(0)
+
 # For diagnosing suspected memory leaks, uncomment this code
 # and similar code in process_event
 # import gc
@@ -358,7 +372,10 @@ class Processor:
 
         for j, plugin in enumerate(self.action_plugins):
             self.log.debug("%s (step %d/%d)" % (plugin.__class__.__name__, j, total_plugins))
-            event = plugin.process_event(event)
+            try:
+                event = plugin.process_event(event)
+            except:
+                raise RuntimeError("Plugin failed: " + plugin.__class__.__name__)
             plugin.total_time_taken += self.timer.punch()
 
         # Uncomment to diagnose memory leaks
@@ -432,9 +449,11 @@ class Processor:
 
                 try:
                     self.log.debug("%s now processing block %d" % (self.worker_id, block_id))
+
                     for i, event in enumerate(event_block):
                         self.check_crash()
-                        event_block[i] = self.process_event(event)
+                        with timeout(seconds=300, error_message="Worker %s timed out." % (self.worker_id)):
+                            event_block[i] = self.process_event(event)
                 except Exception:
                     # Crash occurred during processing: notify everyone else, then die
                     self.status.value = MP_STATUS['crashing']
@@ -519,6 +538,13 @@ class Processor:
         self.check_crash()
         self.update_status()
 
+    @property
+    def queued_events(self):
+        """Return the number of events waiting to be processed, or 0 if we're not multiprocessing"""
+        if hasattr(self, 'input_queue'):
+            return self.input_queue.qsize() * self.block_size
+        return 0
+
     def check_crash(self):
         if self.status.value == MP_STATUS['crashing']:
             if self.worker_id == 'master':
@@ -547,7 +573,7 @@ class Processor:
         sys.stdout.write('\rStatus: %s. Processing queue: %d events. Output queue: %s events. '
                          'RAM usage: %0.1f (master) %0.1f (workers) %0.1f (output)' % (
             [k for k, v in MP_STATUS.items() if v == self.status.value][0],
-            self.input_queue.qsize() * self.block_size,
+            self.queued_events,
             self.output_queue.qsize() * self.block_size,
             get_mem_usage(os.getpid()),
             sum([get_mem_usage(worker.pid) if worker.pid is not None else 0
