@@ -220,11 +220,10 @@ class EveInput(InputFromFolder):
             evefile.seek(0, 0)
             positions = []
             fmd = np.fromfile(evefile, dtype=eve_file_header, count=1)[0]
-            if fmd[
-                "first_event_number"] != 45054:  # before unused field is unequal to 45054 in newer versions of fppdaq
+            if fmd["first_event_number"] != 45054:  
+                # before unused field is unequal to 45054 in newer versions of fppdaq
                 # newer versions of fppgui support an basic event_counter for multiple files
                 j = fmd["first_event_number"]
-                # print(j)
             else:
                 j = 0
             while evefile.tell() < filesize:
@@ -233,12 +232,13 @@ class EveInput(InputFromFolder):
                 evefile.seek(fmd["event_size"] * 4 - 12, 1)
                 positions.append(evefile.tell())
             print("There are events %d-%d in this file" % (j, j + len(positions)))
-            # if j == 0:
-            #    positions.pop(0)  # throw away first event as it is the cae1724_par event
+            
+            #print("delete event " + str(j))
+            positions.pop(0)  # throw away first event as it generates problems
 
             self.event_positions = positions[3:]
 
-            return j, j + len(positions) - 2-3, len(positions)
+            return j, j + len(positions) - 2 - 3, len(positions)
 
     def close(self):
         """Close the currently open file"""
